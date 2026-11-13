@@ -1,0 +1,7 @@
+# Inputs from the original game (not redistributable)
+orig/
+gamedir/
+
+# Build output
+build/
+__pycache__/
