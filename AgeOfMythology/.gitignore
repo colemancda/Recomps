@@ -1,0 +1,6 @@
+# Installed game files (not redistributable)
+orig/
+
+# Build output
+build/
+__pycache__/
