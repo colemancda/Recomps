@@ -80,7 +80,8 @@ int rt_guest_readable(uint32_t addr, uint32_t size);
 
 /* ---- loader (loader.c) ---- */
 typedef struct RtImage {
-    const RtImageDesc *desc;
+    const RtImageDesc *desc; /* NULL for a resource-only DLL mapped as data */
+    char name[64];           /* file name, lower case */
     uint32_t base, size, entry, headers_size, stack_reserve;
     uint32_t rsrc_rva, rsrc_size; /* resource directory */
     uint32_t exp_rva, exp_size;   /* export directory */
@@ -97,6 +98,9 @@ void rt_load_pe(const char *path); /* the EXE, and the lifted DLLs it imports */
 /* Map a lifted DLL (and the lifted DLLs it imports) by file name; NULL if no
  * lifted image has that name. Its DllMain runs at the next rt_dll_attach(). */
 RtImage *rt_load_dll(const char *name);
+/* Map a DLL from the game folder that has no exports (a resource-only language
+ * DLL) as data: its resources become available, no code runs. NULL otherwise. */
+RtImage *rt_load_data_dll(const char *name);
 RtImage *rt_image_at(uint32_t base);            /* lifted DLL with that base (module handle), or NULL */
 RtImage *rt_image_named(const char *name);      /* a mapped lifted DLL, by file name; NULL if not mapped */
 /* Export of a mapped image by name, or by ordinal when name is NULL; 0 if absent.
@@ -106,6 +110,7 @@ uint32_t rt_image_export(RtImage *im, const char *name, uint32_t ordinal);
  * load order. Returns 0 if one of them returned FALSE. */
 int rt_dll_attach(CPU *c);
 int rt_in_lifted_code(uint32_t addr); /* inside some image's code range */
+const char *rt_module_name(uint32_t h); /* DLL name of a host module handle (misc.c), or NULL */
 RtImage *rt_image_of(uint32_t addr);  /* the mapped EXE or DLL containing addr, or NULL */
 
 /* ---- host functions: imports, COM methods, GetProcAddress results (dispatch.c) ----
@@ -113,6 +118,15 @@ RtImage *rt_image_of(uint32_t addr);  /* the mapped EXE or DLL containing addr, 
  * A handler receives its arguments in a[] and returns the EAX value; the
  * dispatcher pops the arguments (stdcall) unless is_cdecl is set. */
 typedef uint32_t (*ImportFn)(CPU *c, const uint32_t *a);
+/* Guest functions replaced by host handlers (lift.py --hook): called like imports. */
+typedef struct RtHook {
+    uint32_t addr;
+    const char *name;
+    ImportFn fn;
+    int nargs; /* stdcall argument count; the handler's return value goes to EAX */
+} RtHook;
+extern const RtHook rt_hooks[];
+extern const unsigned rt_nhooks;
 typedef struct ImportDef {
     const char *dll, *name;
     ImportFn fn;
@@ -146,10 +160,14 @@ typedef struct ImportTable {
 #define RT_EXPORT_IMPORTS(sym, defs) const ImportTable sym = {defs, RT_COUNTOF(defs)}
 extern const ImportTable rt_imports_kernel, rt_imports_thread, rt_imports_seh, rt_imports_user, rt_imports_file,
     rt_imports_registry, rt_imports_misc, rt_imports_winsock, rt_imports_ddraw, rt_imports_dinput, rt_imports_dsound, rt_imports_aom,
-    rt_imports_d3d8, rt_imports_win32w;
+    rt_imports_d3d8, rt_imports_win32w,
+    rt_imports_stubs, rt_imports_gdi, rt_imports_shlwapi;
+void rt_gdi_set_font_dir(const char *dir); /* gdi.c: where the Liberation fonts are */
 
 /* ---- UTF-16 strings and W forms (win32w.c); the host side is UTF-8 ---- */
 uint32_t rt_wlen(uint32_t a);                               /* characters before the NUL */
+int rt_resolve_path(const char *guest, char *out, size_t cap); /* file.c: host path to read a guest file */
+uint32_t rt_resource(uint32_t hmod, uint32_t type, uint32_t id, uint32_t *size); /* file.c */
 size_t rt_get_wstr(uint32_t a, char *out, size_t cap);      /* guest UTF-16 -> host UTF-8 */
 uint32_t rt_put_wstr(uint32_t a, uint32_t cap, const char *s); /* host UTF-8 -> guest UTF-16, cap in chars incl. NUL; returns chars */
 uint32_t rt_wstr_dup(const char *s);                        /* new UTF-16 copy on the guest heap */
@@ -207,7 +225,7 @@ uint32_t rt_handle_alloc(int type, void *obj, void (*close)(void *obj));
 void *rt_handle_get(uint32_t h, int type); /* NULL when h is not a live handle of that type */
 int rt_handle_close(uint32_t h);
 
-enum { RT_W_EVENT = 1, RT_W_MUTEX, RT_W_THREAD, RT_W_PROCESS };
+enum { RT_W_EVENT = 1, RT_W_MUTEX, RT_W_THREAD, RT_W_PROCESS, RT_W_SEMAPHORE };
 RtWaitable *rt_waitable_new(int kind, int manual_reset, int signaled);
 void rt_waitable_signal(RtWaitable *w);
 void rt_waitable_reset(RtWaitable *w);
@@ -256,7 +274,6 @@ typedef struct RtOptions {
     int trace_net;         /* log every datagram and stream chunk sent or received */
     int no_sound;          /* DirectSoundCreate8 reports that there is no sound device */
     char dump_audio[512];  /* WAV file the mixed sound is written to instead of a device */
-    char broker[160];      /* HOST[:PORT] written to the registry as the game's server (registry.c) */
     int pad;               /* game controllers are used (default) */
     int pad_virtual;       /* attach an SDL virtual controller for the input script to drive */
     int trace_input;       /* log controller, touch and key events on their way to the game */
