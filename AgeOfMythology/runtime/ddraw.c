@@ -135,6 +135,11 @@ const char *rt_guid_str(uint32_t g, char buf[40]) {
     return buf;
 }
 
+const char *rt_guid_text(uint32_t guid) {
+    static __thread char buf[40];
+    return guid ? rt_guid_str(guid, buf) : "(null)";
+}
+
 int rt_guid_eq(uint32_t g, const uint8_t ref[16]) { return g && memcmp(G(g), ref, 16) == 0; }
 
 static const uint8_t IID_IUnknown[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46};
