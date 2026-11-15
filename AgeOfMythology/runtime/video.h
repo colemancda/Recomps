@@ -34,6 +34,14 @@ int rt_video_poll(RtInputEvent *ev);
 void rt_video_present(const void *pixels, int width, int height, int pitch, int is555);
 void rt_video_warp_mouse(int x, int y);
 void rt_video_show_cursor(int show);
+/* Pointer shapes. A cursor made from 32-bit ARGB pixels (copied) with its hot spot
+ * returns an id >= 0, -1 if the table is full; any thread. rt_video_set_cursor
+ * selects one for the window: an id from rt_video_cursor_create,
+ * RT_CURSOR_SYSTEM + an SDL_SystemCursor, or RT_CURSOR_NONE. Applied on the video thread. */
+#define RT_CURSOR_SYSTEM 0x1000
+#define RT_CURSOR_NONE (-2) /* SetCursor(NULL): no pointer */
+int rt_video_cursor_create(const uint32_t *argb, int w, int h, int hot_x, int hot_y);
+void rt_video_set_cursor(int id);
 void rt_video_set_title(const char *title);
 void rt_video_message_box(const char *caption, const char *text);
 unsigned rt_video_frames(void);
