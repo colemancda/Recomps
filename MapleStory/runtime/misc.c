@@ -26,8 +26,10 @@ static Module modules[] = {
     {"shfolder.dll", 0, 0}, {"version.dll", 1, 0}, {"rpcrt4.dll", 1, 0},
     {"wininet.dll", 1, 0},  {"netapi32.dll", 1, 0}, {"iphlpapi.dll", 1, 0},
     {"dsound.dll", 0, 0},   {"dinput8.dll", 0, 0},  {"d3d8.dll", 0, 0},
-    /* MapleStory's own DLLs and the anti-cheat driver (stubbed in maple.c). */
+    /* MapleStory's own DLLs and the anti-cheat driver (stubbed in maple.c).
+     * ijl15 and zlz are lifted; npkcrypt and wzmss are stubbed. */
     {"npkcrypt.dll", 0, 0}, {"ijl15.dll", 0, 0},    {"wzmss.dll", 0, 0},
+    {"zlz.dll", 0, 0},
 };
 #define MODULE_BASE 0x70000000u
 #define MODULE_STEP 0x00100000u

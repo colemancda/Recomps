@@ -43,6 +43,7 @@ modules=(
     "gr2d      Gr2D_DX8.dll    -   $build/survey/Gr2D_DX8.functions.csv    -"
     "sounddx8  Sound_DX8.dll   -   $build/survey/Sound_DX8.functions.csv   -"
     "ijl15     ijl15.dll       -   $build/survey/ijl15.functions.csv       -"
+    "zlz       ZLZ.dll         -   $build/survey/ZLZ.functions.csv         -"
 )
 
 # Each function list is Ghidra's export (<stem>.ghidra.csv) plus the code-pointer
