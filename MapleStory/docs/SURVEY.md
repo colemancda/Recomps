@@ -107,3 +107,37 @@ Past the scanner, the client resolves many ordinary Win32 APIs with
 0x97b384" is this, not GameGuard indirection). A slot is null, and the call
 faults, when the runtime does not yet implement that API. These are filled one at
 a time, the usual step-2 work; the GameGuard anti-hack layer itself is passed.
+
+## Boot to the login network stage (step 2 complete)
+
+Past GameGuard, filling the Win32 functions the client resolves with
+`GetProcAddress` (a null slot faults when called) carried the boot to completion.
+Added in `runtime/extra.c`: RECT maths (CopyRect/InflateRect/UnionRect), file
+mapping (CreateFileMapping/MapViewOfFile), OpenProcess, the I/O completion port
+stubs, window hooks, DrawText, OLE init, SHGetSpecialFolderPathA and the IMM
+context functions.
+
+Two lifter fixes were needed:
+- **C++ exception handlers.** MSVC embeds the exception FuncInfo/handler tables in
+  `.text`, and their catch/cleanup funclets can start with a bare `ret`. The
+  client jumps to one (0x405a1c) through the EH dispatch, and it was not a lifted
+  entry. `tools/data_code_pointers.py` now scans `.text` too (accepting prologues
+  or `ret`/`ret n`), so these funclets are lifted.
+- **Far-pointer load.** A spurious entry decoded as a far `jmp [mem]`, emitting
+  `ld48`; it is defined in `cpu.h` to return the 32-bit offset (the selector is
+  ignored in the flat model).
+
+With these, the recompiled client **boots completely**: it runs all CRT and
+engine initialisation, passes GameGuard, **creates its main window**
+(`RegisterClassExA`/`CreateWindowExA`/`ShowWindow` + a `PeekMessageA` loop), and
+**connects to the login server at 127.0.0.1:8484** (`socket`/`connect`, with
+`WSAAsyncSelect` notifications). It then waits for the server's handshake, as a
+MapleStory client does — the server sends the v62 `HelloPacket` (version + send
+and receive IVs) first. With nothing listening it retries and exits.
+
+This is the handoff to a v62 server. `colemancda/maplestory`'s
+`MapleStoryServer62` is exactly that: it speaks the v62 protocol and the matching
+cipher. Pairing the recompiled client with it (client → `MapleStoryServer62` on
+127.0.0.1:8484) is the next milestone. The client also resolves `WSASend`/
+`WSARecv` (overlapped I/O) which are not yet provided; those are the remaining
+Winsock pieces for the receive path.
