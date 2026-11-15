@@ -102,6 +102,7 @@ H(k32_ExitProcess) {
     UNUSED;
     fflush(stdout);
     rt_log("\nguest called ExitProcess(%u)\n", a[0]);
+    if (getenv("RECOMP_TRACE_EXIT")) rt_backtrace(c);
     rt_print_import_stats();
     rt_exit((int)(a[0] & 0xFF));
 }
