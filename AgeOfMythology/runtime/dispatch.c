@@ -80,12 +80,39 @@ static const ImportTable *const import_tables[] = {
     &rt_imports_aom,
     &rt_imports_d3d8,
     &rt_imports_win32w,
+    &rt_imports_stubs,
+    &rt_imports_gdi,
+    &rt_imports_shlwapi,
     &rt_imports_ddraw,
     &rt_imports_dinput,
     &rt_imports_dsound,
 };
 
+/* Winsock is imported by ordinal; these are ws2_32's (and wsock32's) fixed numbers. */
+static const char *winsock_ordinal(unsigned n) {
+    static const struct { unsigned n; const char *name; } ords[] = {
+        {1, "accept"}, {2, "bind"}, {3, "closesocket"}, {4, "connect"}, {5, "getpeername"},
+        {6, "getsockname"}, {7, "getsockopt"}, {8, "htonl"}, {9, "htons"}, {10, "ioctlsocket"},
+        {11, "inet_addr"}, {12, "inet_ntoa"}, {13, "listen"}, {14, "ntohl"}, {15, "ntohs"},
+        {16, "recv"}, {17, "recvfrom"}, {18, "select"}, {19, "send"}, {20, "sendto"},
+        {21, "setsockopt"}, {22, "shutdown"}, {23, "socket"}, {51, "gethostbyaddr"},
+        {52, "gethostbyname"}, {53, "getprotobyname"}, {54, "getprotobynumber"}, {55, "getservbyname"},
+        {56, "getservbyport"}, {57, "gethostname"}, {101, "WSAAsyncSelect"},
+        {102, "WSAAsyncGetHostByAddr"}, {103, "WSAAsyncGetHostByName"}, {108, "WSACancelAsyncRequest"},
+        {111, "WSAGetLastError"}, {112, "WSASetLastError"}, {113, "WSACancelBlockingCall"},
+        {114, "WSAIsBlocking"}, {115, "WSAStartup"}, {116, "WSACleanup"}, {151, "__WSAFDIsSet"},
+    };
+    for (size_t i = 0; i < RT_COUNTOF(ords); i++)
+        if (ords[i].n == n) return ords[i].name;
+    return NULL;
+}
+
 const ImportDef *rt_find_import_def(const char *dll, const char *name) {
+    if (name[0] == '#' && (!strcasecmp(dll, "ws2_32.dll") || !strcasecmp(dll, "wsock32.dll"))) {
+        const char *named = winsock_ordinal((unsigned)atoi(name + 1));
+        if (named) name = named;
+        dll = "ws2_32.dll";
+    }
     for (size_t t = 0; t < RT_COUNTOF(import_tables); t++) {
         const ImportDef *defs = import_tables[t]->defs;
         for (unsigned i = 0; i < import_tables[t]->count; i++)
@@ -119,7 +146,11 @@ uint32_t rt_register_import(const char *dll, const char *name, uint32_t iat_va) 
     return a;
 }
 
+/* A host entry point for dll!name. Its calling convention comes from the import
+ * table: a cdecl handler (wsprintf) must leave the arguments to the caller. */
 uint32_t rt_host_fn(const char *dll, const char *name, ImportFn fn, int nargs) {
+    const ImportDef *def = fn ? rt_find_import_def(dll, name) : NULL;
+    int is_cdecl = def && def->fn == fn ? def->is_cdecl : 0;
     pthread_mutex_lock(&imports_mu);
     uint32_t a = 0;
     for (uint32_t i = 0; i < g_nimports; i++) {
@@ -128,7 +159,7 @@ uint32_t rt_host_fn(const char *dll, const char *name, ImportFn fn, int nargs) {
             break;
         }
     }
-    if (!a) a = import_add(dll, name, fn, nargs, 0, 0);
+    if (!a) a = import_add(dll, name, fn, nargs, is_cdecl, 0);
     pthread_mutex_unlock(&imports_mu);
     return a;
 }
@@ -199,6 +230,16 @@ static int import_index(uint32_t addr) {
     uint32_t off = addr - GUEST_IMP_BASE;
     if (off < 16 * g_nimports && (off & 15) == 0) return (int)(off / 16);
     return -1;
+}
+
+void rt_hook(CPU *c, uint32_t addr) {
+    for (unsigned i = 0; i < rt_nhooks; i++) {
+        if (rt_hooks[i].addr != addr) continue;
+        uint32_t a = rt_host_fn("hook", rt_hooks[i].name, rt_hooks[i].fn, rt_hooks[i].nargs);
+        rt_import_call(c, (a - GUEST_IMP_BASE) / 16);
+        return;
+    }
+    rt_fatal(c, 4, "function 0x%08x was lifted as a hook, but the runtime has no handler for it", addr);
 }
 
 void rt_call_slow(CPU *c, uint32_t addr) {
