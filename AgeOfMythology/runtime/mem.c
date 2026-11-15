@@ -98,7 +98,11 @@ static uint32_t heap_bins[HEAP_NCLASS];
 /* Capacity (payload bytes) and bin for a request. */
 static uint32_t heap_class(uint32_t size, uint32_t *cap) {
     if (size < 8) size = 8;
-    if (size <= HEAP_SMALL_MAX) {
+    /* Small classes are whole blocks of at most HEAP_SMALL_MAX bytes (bins 0..127);
+     * larger blocks use the geometric bins from 128. A request of 2041..2048 bytes
+     * once made a 2064-byte "small" block whose bin (128) was also the first large
+     * bin, so a freed one was handed out later as a 2560-byte block. */
+    if (size + HEAP_HDR <= HEAP_SMALL_MAX) {
         uint32_t c = (size + HEAP_HDR + 15) & ~15u; /* whole block is a multiple of 16 */
         *cap = c - HEAP_HDR;
         return c / 16 - 1;
@@ -114,6 +118,40 @@ static uint32_t heap_class(uint32_t size, uint32_t *cap) {
     return bin < HEAP_NCLASS ? bin : HEAP_NCLASS - 1;
 }
 
+/* RECOMP_HEAP_DEBUG=1: remember who freed each block (the guest return address
+ * of the call that freed it), fill freed payloads with 0xDD, and check both when
+ * the block is reused, to find writes after free. */
+static uint32_t *heap_freed_by;
+static int heap_debug_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("RECOMP_HEAP_DEBUG") && atoi(getenv("RECOMP_HEAP_DEBUG"));
+        if (on) heap_freed_by = calloc((GUEST_HEAP_END - GUEST_HEAP_BASE) / 8, 4);
+    }
+    return on;
+}
+static void heap_check_free(uint32_t p) {
+    uint32_t cap = ld32(p - 8), bad = 0;
+    for (uint32_t i = 4; i < cap; i++)
+        if (ld8(p + i) != 0xDD) {
+            bad = p + i;
+            break;
+        }
+    uint32_t link = ld32(p);
+    int link_ok = link == 0 || (link >= GUEST_HEAP_BASE && link < heap_brk && ld32(link - 4) == HEAP_FREE);
+    if (ld32(p - 4) != HEAP_FREE || bad || !link_ok) {
+        fprintf(stderr, "recomp: heap: free block %#x (capacity %u, freed from guest %#x) was written after free",
+                p, cap, heap_freed_by[(p - GUEST_HEAP_BASE) / 8]);
+        if (bad) fprintf(stderr, ", first at +%#x", bad - p);
+        fprintf(stderr, "\n  ");
+        for (uint32_t i = 0; i < 48 && i < cap; i += 4) fprintf(stderr, "%08x ", ld32(p + i));
+        fprintf(stderr, "\n");
+        CPU *c = rt_cpu();
+        if (c) rt_backtrace(c);
+        rt_exit(6);
+    }
+}
+
 static uint32_t heap_alloc_locked(uint32_t size, int zero) {
     uint32_t cap;
     if (size > 0x10000000u) return 0;
@@ -121,6 +159,7 @@ static uint32_t heap_alloc_locked(uint32_t size, int zero) {
     uint32_t p = 0;
     if (bin != HEAP_NCLASS - 1 && heap_bins[bin]) {
         p = heap_bins[bin];
+        if (heap_debug_on()) heap_check_free(p);
         heap_bins[bin] = ld32(p);
         if (zero) memset(G(p), 0, size);
     } else {
@@ -143,15 +182,19 @@ static uint32_t heap_alloc_locked(uint32_t size, int zero) {
 
 static uint32_t heap_size_locked(uint32_t p) {
     if (p < GUEST_HEAP_BASE + HEAP_HDR || p >= heap_brk || (p & 7)) return 0xFFFFFFFFu;
-    uint32_t sz = ld32(p - 4);
-    if (sz == HEAP_FREE || sz > ld32(p - 8)) return 0xFFFFFFFFu;
+    uint32_t sz = ld32(p - 4), cap = ld32(p - 8), c2;
+    if (sz == HEAP_FREE || sz > cap || p + cap > heap_brk) return 0xFFFFFFFFu;
+    heap_class(cap, &c2);
+    if (c2 != cap) return 0xFFFFFFFFu; /* not a capacity this allocator hands out */
     return sz;
 }
 
 static void heap_free_locked(uint32_t p) {
     if (!p) return;
     if (heap_size_locked(p) == 0xFFFFFFFFu) {
-        fprintf(stderr, "recomp: warning: free of invalid heap block %#x ignored\n", p);
+        CPU *c = rt_cpu();
+        fprintf(stderr, "recomp: warning: free of invalid heap block %#x ignored (guest caller %#x)\n", p,
+                c ? ld32(ESP) : 0);
         return;
     }
     uint32_t cap, dummy;
@@ -159,6 +202,18 @@ static void heap_free_locked(uint32_t p) {
     uint32_t bin = heap_class(cap, &dummy);
     st32(p - 4, HEAP_FREE);
     if (bin == HEAP_NCLASS - 1) return; /* oversize blocks are not recycled */
+    if (heap_debug_on()) {
+        CPU *c = rt_cpu();
+        heap_freed_by[(p - GUEST_HEAP_BASE) / 8] = c ? ld32(ESP) : 0;
+        memset(G(p), 0xDD, cap);
+    }
+    /* RECOMP_HEAP_QUARANTINE=1: never reuse freed blocks, to tell use-after-free apart */
+    static int quarantine = -1;
+    if (quarantine < 0) quarantine = getenv("RECOMP_HEAP_QUARANTINE") && atoi(getenv("RECOMP_HEAP_QUARANTINE"));
+    if (quarantine) {
+        memset(G(p), 0xDD, cap);
+        return;
+    }
     st32(p, heap_bins[bin]);
     heap_bins[bin] = p;
 }
