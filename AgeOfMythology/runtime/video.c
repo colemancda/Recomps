@@ -409,6 +409,10 @@ static void dump_frame(const uint16_t *px, int w, int h) {
 #ifndef RT_NO_SDL
 static SDL_Window *window;
 static SDL_Renderer *renderer;
+/* The window's renderer draws with GL while Direct3D's EGL context lives on the same
+ * thread (Wayland, where SDL has no plain software surface): SDL is told to make its
+ * own context current again before each frame it draws. */
+static int renderer_shares_gl;
 static SDL_Texture *texture;
 static int tex_w, tex_h;
 
@@ -709,6 +713,14 @@ static void sdl_open(const char *title, int width, int height) {
     if (window && !gl_in_use)
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (window && !renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    if (window && !renderer && gl_in_use) {
+        /* Wayland: SDL2's software renderer needs a GL-backed window surface. Both
+         * contexts are EGL there, so they can take turns on this thread. */
+        SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "1");
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        renderer_shares_gl = renderer != NULL;
+    }
     if (!window || !renderer) {
         rt_log("recomp: cannot create the SDL window (%s); continuing without one\n", SDL_GetError());
         rt_affinity_host(0);
@@ -754,6 +766,9 @@ static void dump_window(unsigned frame) {
 static void cursor_apply(void);
 static void sdl_flush(void) {
     cursor_apply();
+    /* d3d8gl.c made its own context current behind SDL's back; forgetting SDL's makes
+     * the renderer activate its context again before it draws */
+    if (renderer_shares_gl) SDL_GL_MakeCurrent(window, NULL);
     pthread_mutex_lock(&frame_mu);
     if (frame_dirty && frame_px) {
         if (!texture || tex_w != frame_w || tex_h != frame_h) {
