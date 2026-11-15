@@ -96,6 +96,7 @@ t_bits vectors=440 hash=ac5c5470
 t_xadd_cmpxchg vectors=968 hash=5d646e26
 t_lock_ops vectors=1452 hash=621deacd
 t_seg_pushpop vectors=22 hash=a0a9d295
+t_xlat vectors=484 hash=f0a6363a
 t_wide_arith vectors=5929 hash=f20376ca
 t_stack vectors=484 hash=73c6f963
 t_calls vectors=484 hash=4a018803
