@@ -159,7 +159,7 @@ typedef struct ImportTable {
 #define RT_COUNTOF(a) (sizeof(a) / sizeof((a)[0]))
 #define RT_EXPORT_IMPORTS(sym, defs) const ImportTable sym = {defs, RT_COUNTOF(defs)}
 extern const ImportTable rt_imports_kernel, rt_imports_thread, rt_imports_seh, rt_imports_user, rt_imports_file,
-    rt_imports_registry, rt_imports_misc, rt_imports_winsock, rt_imports_ddraw, rt_imports_dinput, rt_imports_dsound, rt_imports_maple,
+    rt_imports_registry, rt_imports_misc, rt_imports_winsock, rt_imports_ddraw, rt_imports_dinput, rt_imports_dsound, rt_imports_maple, rt_imports_extra,
     rt_imports_d3d8, rt_imports_win32w,
     rt_imports_stubs, rt_imports_gdi, rt_imports_shlwapi;
 void rt_gdi_set_font_dir(const char *dir); /* gdi.c: where the Liberation fonts are */
