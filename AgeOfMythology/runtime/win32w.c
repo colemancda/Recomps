@@ -284,6 +284,13 @@ H(k32_SleepEx) {
 }
 H(k32_InterlockedIncrement) { UNUSED; return rt_atomic_add32(a[0], 1) + 1; }
 H(k32_InterlockedDecrement) { UNUSED; return rt_atomic_add32(a[0], 0xFFFFFFFFu) - 1; }
+H(k32_InterlockedCompareExchange) {
+    UNUSED;
+    uint32_t expected = a[2];
+    __atomic_compare_exchange_n((uint32_t *)G(a[0]), &expected, a[1], 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected; /* the initial value */
+}
+H(k32_InterlockedExchangeAdd) { UNUSED; return rt_atomic_add32(a[0], a[1]); }
 H(k32_HeapValidate) { UNUSED; return 1; }
 H(k32_HeapCompact) { UNUSED; return 0x100000; }
 H(k32_HeapWalk) { UNUSED; rt_set_last_error(c, 259); return 0; }
@@ -393,6 +400,21 @@ H(k32_GetLocaleInfoW) {
     rt_put_wstr(a[2], n, s);
     return n;
 }
+/* GetCPInfoExW(codepage, flags, CPINFOEXW*): single-byte code pages only (CP_ACP is 1252). */
+H(k32_GetCPInfoExW) {
+    UNUSED;
+    uint32_t cp = a[0] == 0 || a[0] == 3 ? 1252 : a[0] == 1 ? 437 : a[0];
+    uint32_t p = a[2];
+    memset(G(p), 0, 544);
+    st32(p, cp == 65001 ? 4 : 1);
+    st8(p + 4, '?');
+    st16(p + 18, '?');
+    st32(p + 20, cp);
+    char name[64];
+    snprintf(name, sizeof name, "%u (%s)", cp, cp == 1252 ? "ANSI - Latin I" : cp == 437 ? "OEM - United States" : "");
+    rt_put_wstr(p + 24, 260, name);
+    return 1;
+}
 H(k32_GetUserDefaultLCID) { UNUSED; return 0x409; }
 H(k32_GetEnvironmentVariableA) {
     UNUSED;
@@ -448,7 +470,80 @@ H(k32_lstrcatA) {
     return a[0];
 }
 
+/* OSVERSIONINFOW (276 bytes) or OSVERSIONINFOEXW (284): Windows XP SP2, as GetVersionExA. */
+H(k32_GetVersionExW) {
+    UNUSED;
+    uint32_t p = a[0], size = ld32(p);
+    if (size < 276) {
+        rt_set_last_error(c, 122);
+        return 0;
+    }
+    st32(p + 4, 5);
+    st32(p + 8, 1);
+    st32(p + 12, 2600);
+    st32(p + 16, 2); /* VER_PLATFORM_WIN32_NT */
+    memset(G(p + 20), 0, 256);
+    rt_put_wstr(p + 20, 128, "Service Pack 2");
+    if (size >= 284) {
+        st16(p + 276, 2); /* wServicePackMajor */
+        st16(p + 278, 0);
+        st16(p + 280, 0x100);
+        st8(p + 282, 1); /* VER_NT_WORKSTATION */
+        st8(p + 283, 0);
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------- shell folders */
+/* SHGetFolderPath(hwnd, csidl, token, flags, path): the guest's special folders.
+ * They live under <savedir>/drive_c like every path outside the game folder. */
+static const char *folder_path(uint32_t csidl) {
+    switch (csidl & 0xFF) {
+    case 0x05: return "C:\\Documents and Settings\\Player\\My Documents"; /* CSIDL_PERSONAL */
+    case 0x1A: return "C:\\Documents and Settings\\Player\\Application Data"; /* CSIDL_APPDATA */
+    case 0x1C: return "C:\\Documents and Settings\\Player\\Local Settings\\Application Data";
+    case 0x23: return "C:\\Documents and Settings\\All Users\\Application Data"; /* COMMON_APPDATA */
+    case 0x2E: return "C:\\Documents and Settings\\All Users\\Documents"; /* COMMON_DOCUMENTS */
+    case 0x10: return "C:\\Documents and Settings\\Player\\Desktop";
+    case 0x24: return "C:\\WINDOWS";
+    case 0x25: return "C:\\WINDOWS\\system32";
+    case 0x26: return "C:\\Program Files";
+    default: return NULL;
+    }
+}
+static uint32_t sh_folder(CPU *c, const uint32_t *a, int wide) {
+    const char *p = folder_path(a[1]);
+    if (!p) {
+        rt_log("[shell] SHGetFolderPath: folder %#x not provided\n", a[1]);
+        return 0x80070057u; /* E_INVALIDARG */
+    }
+    /* Create it (and its parents) when asked, and always for the player's own
+     * folders, which exist on any real system. */
+    const ImportDef *mk = rt_find_import_def("kernel32.dll", "CreateDirectoryA");
+    uint32_t tmp = rt_heap_alloc(260, 1);
+    for (const char *q = p + 3;; q++) {
+        if (*q == '\\' || !*q) {
+            memcpy(G(tmp), p, (size_t)(q - p));
+            st8(tmp + (uint32_t)(q - p), 0);
+            uint32_t args[2] = {tmp, 0};
+            mk->fn(c, args);
+        }
+        if (!*q) break;
+    }
+    rt_heap_free(tmp);
+    if (wide) rt_put_wstr(a[4], 260, p);
+    else snprintf((char *)G(a[4]), 260, "%s", p);
+    if (g_opt.verbose) rt_log("[shell] SHGetFolderPath(%#x) -> %s\n", a[1], p);
+    return 0;
+}
+H(sh_SHGetFolderPathW) { return sh_folder(c, a, 1); }
+H(sh_SHGetFolderPathA) { return sh_folder(c, a, 0); }
+
 static const ImportDef defs[] = {
+    {"shfolder.dll", "SHGetFolderPathW", sh_SHGetFolderPathW, 5, 0},
+    {"shfolder.dll", "SHGetFolderPathA", sh_SHGetFolderPathA, 5, 0},
+    {"shell32.dll", "SHGetFolderPathW", sh_SHGetFolderPathW, 5, 0},
+    {"shell32.dll", "SHGetFolderPathA", sh_SHGetFolderPathA, 5, 0},
     {"kernel32.dll", "CreateFileW", k32_CreateFileW, 7, 0},
     {"kernel32.dll", "DeleteFileW", k32_DeleteFileW, 1, 0},
     {"kernel32.dll", "CreateDirectoryW", k32_CreateDirectoryW, 2, 0},
@@ -478,6 +573,7 @@ static const ImportDef defs[] = {
     {"kernel32.dll", "GetLogicalDrives", k32_GetLogicalDrives, 0, 0},
     {"kernel32.dll", "GetDiskFreeSpaceA", k32_GetDiskFreeSpaceA, 5, 0},
     {"kernel32.dll", "GetCommandLineW", k32_GetCommandLineW, 0, 0},
+    {"kernel32.dll", "GetVersionExW", k32_GetVersionExW, 1, 0},
     {"kernel32.dll", "SetHandleCount", k32_SetHandleCount, 1, 0},
     {"kernel32.dll", "DisableThreadLibraryCalls", k32_DisableThreadLibraryCalls, 1, 0},
     {"kernel32.dll", "IsProcessorFeaturePresent", k32_IsProcessorFeaturePresent, 1, 0},
@@ -493,6 +589,8 @@ static const ImportDef defs[] = {
     {"kernel32.dll", "SleepEx", k32_SleepEx, 2, 0},
     {"kernel32.dll", "InterlockedIncrement", k32_InterlockedIncrement, 1, 0},
     {"kernel32.dll", "InterlockedDecrement", k32_InterlockedDecrement, 1, 0},
+    {"kernel32.dll", "InterlockedCompareExchange", k32_InterlockedCompareExchange, 3, 0},
+    {"kernel32.dll", "InterlockedExchangeAdd", k32_InterlockedExchangeAdd, 2, 0},
     {"kernel32.dll", "HeapValidate", k32_HeapValidate, 3, 0},
     {"kernel32.dll", "HeapCompact", k32_HeapCompact, 2, 0},
     {"kernel32.dll", "HeapWalk", k32_HeapWalk, 2, 0},
@@ -517,6 +615,9 @@ static const ImportDef defs[] = {
     {"kernel32.dll", "GetLocaleInfoA", k32_GetLocaleInfoA, 4, 0},
     {"kernel32.dll", "GetLocaleInfoW", k32_GetLocaleInfoW, 4, 0},
     {"kernel32.dll", "GetUserDefaultLCID", k32_GetUserDefaultLCID, 0, 0},
+    {"kernel32.dll", "GetSystemDefaultLCID", k32_GetUserDefaultLCID, 0, 0},
+    {"kernel32.dll", "GetUserDefaultLangID", k32_GetUserDefaultLCID, 0, 0},
+    {"kernel32.dll", "GetCPInfoExW", k32_GetCPInfoExW, 3, 0},
     {"kernel32.dll", "IsValidLocale", k32_one, 2, 0},
     {"kernel32.dll", "IsValidCodePage", k32_one, 1, 0},
     {"kernel32.dll", "IsDBCSLeadByteEx", k32_zero, 2, 0},
