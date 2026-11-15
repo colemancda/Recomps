@@ -91,8 +91,19 @@ C++ static initialisers (not just the stubbed `npkcrypt` imports):
   slots. Hooking the scanner alone is not enough: the table must be populated or
   each call site handled.
 
-Defeating this obfuscated layer — identifying every anti-hack entry point and
-either neutralising the checks or emulating the GameGuard responses the client
-expects — is the next focused effort. Until then the recompiled client boots
-through its entire CRT and engine initialisation and stops at the scanner, which
-is a clean, reproducible checkpoint.
+**Resolved.** The scanner is not obfuscated anti-cheat but a **DLL-planting
+check**: it enumerates the game folder (`FindFirstFileA "*"`) and, for each file,
+compares the name against a whitelist of ~16 Windows system DLLs (kernel32,
+user32, ws2_32, msvcrt, d3d8, …). A match means a system DLL has been *planted*
+in the game folder (a DLL-search-order hijack), so it errors. A real install has
+none of these in its folder and passes. The recompilation only failed because the
+build copies **`msvcrt.dll`** into the game folder to lift it, and `msvcrt.dll` is
+on the whitelist. The fix: keep lifted system DLLs in a `syslib/` subfolder that
+the top-level scan does not enumerate, which the loader also searches
+(`runtime/loader.c`); `build.sh` reads `orig/syslib/msvcrt.dll`.
+
+Past the scanner, the client resolves many ordinary Win32 APIs with
+`GetProcAddress` and calls through the stored pointers (the "table around
+0x97b384" is this, not GameGuard indirection). A slot is null, and the call
+faults, when the runtime does not yet implement that API. These are filled one at
+a time, the usual step-2 work; the GameGuard anti-hack layer itself is passed.
