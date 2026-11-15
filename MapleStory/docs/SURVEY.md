@@ -168,3 +168,48 @@ decodes the JPEGs — its boot-time stubs were removed), and then pair with
 `colemancda/maplestory`'s `MapleStoryServer62` for the full login. (The Swift
 server has its own Linux-portability issues — `XMLParser`/`FoundationXML` and a
 socket `featureUnsupported` error — separate from the recompilation.)
+
+## Login screen: the real blocker is the lifted Wz resource engine, not the network
+
+Running under a real window on Xvfb (`DISPLAY=:99`, so SDL opens an X11 window
+with a running message pump) ruled out the message-pump theory above: the client
+still exits right after Direct3D init, without presenting the login screen. A
+backtrace at the exit (see the `RECOMP_TRACE_EXIT` instrumentation below) shows a
+**clean** teardown — `PostQuitMessage(0)` -> `WM_QUIT` -> `WinMain` returns ->
+CRT `exit(0)` — not a crash. The network path is fine: the WSAAsyncSelect
+FD_CONNECT/FD_READ window messages *are* delivered and pumped (the client calls
+`recv` and reads all 15 handshake bytes, which in that model only happens after
+those messages arrive).
+
+Reference check against the genuine client: `GMSv62.exe` run under Wine 10
+against the same mock handshake server **stays alive at an idle login screen**
+(killed only by a 40 s timeout, `WINE_EXIT=124`) and opens ~20 resource files
+(List.wz, MapleStoryUS.ini, LV0.INI, String.wz, Character.wz, UI.wz, ...). So the
+handshake alone is enough to render the login screen — the divergence is ours.
+
+Root cause: the exit is triggered by a caught C++ exception during login/input
+setup (`FUN_0052625f`, which does CreateEventA x3 + DirectInput8Create + reads
+resource properties). Decoding the throws (MSVC `__CxxThrowException`, code
+0xE06D7363):
+
+  - `ZException`               — benign: `C:\WINDOWS\system32\msexcr.ini` absent.
+  - `_com_error (hr=80070057)` — E_INVALIDARG, caught and recovered.
+  - `_com_error (hr=80030002)` — **STG_E_FILENOTFOUND**, the fatal one. A
+    `#import` COM smart-pointer wrapper turned a failed HRESULT from a Wz
+    resource/property call into a throw; the top-level handler responds by
+    shutting the client down cleanly.
+
+Our client opens **only Base.wz** (the ~6.5 KB root index) and then a child
+lookup in the lifted resource engine returns STG_E_FILENOTFOUND *before any
+sub-`.wz` is opened* — i.e. the lifted ResMan/PCOM/NameSpace (PCOM.dll @
+0x50c00000, ResMan.dll @ 0x51000000, NameSpace.dll @ 0x50800000) fail to mount /
+navigate the Wz namespace, where the real DLLs mount the whole `.wz` set. This is
+a correctness bug inside the lifted engine DLLs (or a runtime primitive they rely
+on), not a missing import stub. Next step is to debug the Wz-mount path in the
+lifted ResMan against the real DLL's behaviour under Wine (compare the file-open
+sequence and the namespace it builds).
+
+Debug instrumentation added for this (all cost-free unless enabled):
+  - `RECOMP_TRACE_EXIT=1` -> guest backtrace at `ExitProcess` and `PostQuitMessage`.
+  - `--trace-imports` now decodes each MSVC C++ throw's catchable type names, and
+    prints the HRESULT for a thrown `_com_error` (`runtime/seh.c`).
