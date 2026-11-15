@@ -131,6 +131,12 @@ static int resolve2(const char *guest, int write, char *out, size_t cap, int *in
     const char *p = guest;
     int absolute = 0;
     if (in_game) *in_game = 0;
+    /* "\\C:\dir" and "/C:/dir" (what URL-to-path conversions leave) name C:\dir */
+    {
+        const char *q = p;
+        while (*q == '\\' || *q == '/') q++;
+        if (q != p && ((q[0] | 0x20) >= 'a' && (q[0] | 0x20) <= 'z') && q[1] == ':') p = q;
+    }
     if (((p[0] | 0x20) >= 'a' && (p[0] | 0x20) <= 'z') && p[1] == ':') {
         p += 2;
         absolute = *p == '\\' || *p == '/';
@@ -186,6 +192,9 @@ static int resolve2(const char *guest, int write, char *out, size_t cap, int *in
 static int resolve(const char *guest, int write, char *out, size_t cap, int *in_game) {
     return resolve2(guest, write, out, cap, in_game, NULL);
 }
+
+/* Host path of a guest path, for reading. */
+int rt_resolve_path(const char *guest, char *out, size_t cap) { return resolve(guest, 0, out, cap, NULL); }
 
 static int copy_file(const char *from, const char *to) {
     int in = open(from, O_RDONLY | O_CLOEXEC);
@@ -452,6 +461,13 @@ static uint32_t attributes_of(const struct stat *st) {
 H(k32_GetFileAttributesA) {
     char host[768];
     struct stat st;
+    /* Wildcards and the other characters Windows forbids in names: ERROR_INVALID_NAME.
+     * MSLU's loader tells NT from Windows 9x by this answer for "???.???". */
+    const char *name = rt_gstr(a[0]);
+    if (strpbrk(name[0] && name[1] == ':' ? name + 2 : name, "*?<>|\"")) {
+        rt_set_last_error(c, 123);
+        return 0xFFFFFFFFu;
+    }
     if (!resolve(rt_gstr(a[0]), 0, host, sizeof host, NULL) || stat(host, &st) != 0) {
         rt_set_last_error(c, ERROR_FILE_NOT_FOUND);
         return 0xFFFFFFFFu;
@@ -578,9 +594,17 @@ static uint32_t find_first(CPU *c, const char *g, uint32_t out, int wide) {
         /* the directory may exist in both trees */
         size_t n = strlen(g_opt.savedir);
         if (!strncmp(host, g_opt.savedir, n)) {
-            char both[768];
-            snprintf(both, sizeof both, "%.300s%.400s", g_opt.gamedir, host + n);
-            find_collect(f, both, pat);
+            /* the same directory in the game tree, names matched without regard to case */
+            char comps[32][256], both[768];
+            int nc = 0;
+            for (const char *p = host + n; *p && nc < 32;) {
+                while (*p == '/') p++;
+                size_t len = strcspn(p, "/");
+                if (!len) break;
+                snprintf(comps[nc++], 256, "%.*s", (int)(len > 255 ? 255 : len), p);
+                p += len;
+            }
+            if (walk(g_opt.gamedir, comps, nc, both, sizeof both)) find_collect(f, both, pat);
         }
     }
     int found = find_fill(f, out, wide);
@@ -627,53 +651,147 @@ H(k32_GetSystemDirectoryA) {
 /* ------------------------------------------------------------ resources
  * FindResource walks the three-level resource directory of the image:
  * type, name, language. Names and types are integers or strings. */
-static uint32_t rsrc_lookup(uint32_t dir, uint32_t key) {
-    uint32_t base = g_image.base + g_image.rsrc_rva;
+/* ---------------------------------------------------------------- resources
+ * A module handle is the module's base: 0 or the EXE's base for the EXE, a
+ * lifted DLL, or a resource-only DLL mapped as data. Names and types are
+ * integer ids or strings; the strings arrive here as host UTF-8. */
+static RtImage *rsrc_image(uint32_t hmod) {
+    if (!hmod || hmod == g_image.base) return &g_image;
+    RtImage *im = rt_image_at(hmod);
+    return im && im->rsrc_rva ? im : NULL;
+}
+
+/* Entry of directory `dir` for an id (s == NULL) or a name; returns its offset word, 0 if absent. */
+static uint32_t rsrc_lookup(uint32_t base, uint32_t dir, uint32_t id, const char *s) {
     uint32_t nnamed = ld16(dir + 12), nid = ld16(dir + 14);
     for (uint32_t i = 0; i < nnamed + nid; i++) {
         uint32_t e = dir + 16 + 8 * i;
         uint32_t name = ld32(e), off = ld32(e + 4);
-        if (key >= 0x10000) {
+        if (s) {
             if (!(name & 0x80000000u)) continue;
             uint32_t ws = base + (name & 0x7FFFFFFF);
             uint32_t len = ld16(ws);
-            const char *want = rt_gstr(key);
-            if (strlen(want) != len) continue;
+            if (strlen(s) != len) continue;
             uint32_t k;
             for (k = 0; k < len; k++)
-                if (toupper((unsigned char)want[k]) != toupper(ld16(ws + 2 + 2 * k) & 0xFF)) break;
+                if (toupper((unsigned char)s[k]) != toupper(ld16(ws + 2 + 2 * k) & 0xFF)) break;
             if (k == len) return off;
-        } else if (!(name & 0x80000000u) && name == key) {
+        } else if (!(name & 0x80000000u) && name == id) {
             return off;
         }
     }
     return 0;
 }
 
-static uint32_t find_resource(CPU *c, uint32_t name, uint32_t type) {
-    if (!g_image.rsrc_rva) {
-        rt_set_last_error(c, 1812); /* ERROR_RESOURCE_DATA_NOT_FOUND */
-        return 0;
-    }
-    uint32_t base = g_image.base + g_image.rsrc_rva;
-    uint32_t off = rsrc_lookup(base, type);
-    if (off & 0x80000000u) off = rsrc_lookup(base + (off & 0x7FFFFFFF), name);
-    else off = 0;
+/* IMAGE_RESOURCE_DATA_ENTRY of (type, name) in the module, first language; 0 if absent. */
+static uint32_t rsrc_find(RtImage *im, uint32_t type, const char *type_s, uint32_t name, const char *name_s) {
+    if (!im || !im->rsrc_rva) return 0;
+    uint32_t base = im->base + im->rsrc_rva;
+    uint32_t off = rsrc_lookup(base, base, type, type_s);
+    if (!(off & 0x80000000u)) return 0;
+    off = rsrc_lookup(base, base + (off & 0x7FFFFFFF), name, name_s);
     if (off & 0x80000000u) {
         uint32_t dir = base + (off & 0x7FFFFFFF);
-        off = ld16(dir + 12) + ld16(dir + 14) ? ld32(dir + 16 + 4) : 0; /* first language */
+        off = ld16(dir + 12) + ld16(dir + 14) ? ld32(dir + 16 + 4) : 0;
     }
-    if (!off || (off & 0x80000000u)) {
-        rt_set_last_error(c, 1814); /* ERROR_RESOURCE_NAME_NOT_FOUND */
-        return 0;
-    }
-    return base + off; /* IMAGE_RESOURCE_DATA_ENTRY */
+    if (!off || (off & 0x80000000u)) return 0;
+    return base + off;
 }
 
-H(k32_FindResourceA) { return find_resource(c, a[1], a[2]); }
-H(k32_FindResourceExA) { return find_resource(c, a[2], a[1]); }
-H(k32_LoadResource) { UNUSED; return a[1] ? g_image.base + ld32(a[1]) : 0; }
+/* Data of resource (type, id) of a module (0 = the EXE) in guest memory, its size in
+ * *size; 0 if absent. */
+uint32_t rt_resource(uint32_t hmod, uint32_t type, uint32_t id, uint32_t *size) {
+    RtImage *im = rsrc_image(hmod);
+    uint32_t e = rsrc_find(im, type, NULL, id, NULL);
+    if (!e) return 0;
+    if (size) *size = ld32(e + 4);
+    return im->base + ld32(e);
+}
+
+/* A resource name or type argument: an integer id, "#123", or a string (A or W). */
+static const char *rsrc_key(uint32_t v, int wide, uint32_t *id, char *buf, size_t cap) {
+    if (v < 0x10000) {
+        *id = v;
+        return NULL;
+    }
+    if (wide) rt_get_wstr(v, buf, cap);
+    else snprintf(buf, cap, "%s", rt_gstr(v));
+    if (buf[0] == '#') {
+        *id = (uint32_t)atoi(buf + 1);
+        return NULL;
+    }
+    *id = 0;
+    return buf;
+}
+
+static uint32_t find_resource(CPU *c, uint32_t hmod, uint32_t name, uint32_t type, int wide) {
+    char nb[128], tb[128];
+    uint32_t nid, tid;
+    const char *ns = rsrc_key(name, wide, &nid, nb, sizeof nb), *ts = rsrc_key(type, wide, &tid, tb, sizeof tb);
+    uint32_t r = rsrc_find(rsrc_image(hmod), tid, ts, nid, ns);
+    if (!r) rt_set_last_error(c, 1814); /* ERROR_RESOURCE_NAME_NOT_FOUND */
+    return r;
+}
+
+H(k32_FindResourceA) { return find_resource(c, a[0], a[1], a[2], 0); }
+H(k32_FindResourceW) { return find_resource(c, a[0], a[1], a[2], 1); }
+H(k32_FindResourceExA) { return find_resource(c, a[0], a[2], a[1], 0); }
+H(k32_FindResourceExW) { return find_resource(c, a[0], a[2], a[1], 1); }
+H(k32_LoadResource) {
+    UNUSED;
+    RtImage *im = rsrc_image(a[0]);
+    return a[1] && im ? im->base + ld32(a[1]) : 0;
+}
 H(k32_SizeofResource) { UNUSED; return a[1] ? ld32(a[1] + 4) : 0; }
+H(k32_FreeResource) { UNUSED; return 0; }
+
+/* LoadString(hinst, id, buf, cch). String tables: RT_STRING (6) block id/16 + 1
+ * holds 16 counted UTF-16 strings. LoadStringW with cch 0 stores a pointer to
+ * the (unterminated) resource text in *buf and returns its length. */
+static uint32_t load_string(CPU *c, const uint32_t *a, int wide) {
+    RtImage *im = rsrc_image(a[0]);
+    uint32_t e = rsrc_find(im, 6, NULL, (a[1] >> 4) + 1, NULL);
+    if (!e) {
+        rt_set_last_error(c, 1814);
+        return 0;
+    }
+    uint32_t p = im->base + ld32(e);
+    for (uint32_t i = 0; i < (a[1] & 15); i++) p += 2 + 2 * ld16(p);
+    uint32_t len = ld16(p), str = p + 2;
+    if (wide && a[3] == 0) {
+        st32(a[2], str);
+        return len;
+    }
+    if (!a[3]) return 0;
+    uint32_t n = len < a[3] - 1 ? len : a[3] - 1;
+    if (wide) {
+        memcpy(G(a[2]), G(str), 2 * n);
+        st16(a[2] + 2 * n, 0);
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            uint16_t ch = ld16(str + 2 * i);
+            st8(a[2] + i, ch < 256 ? (uint8_t)ch : '?');
+        }
+        st8(a[2] + n, 0);
+    }
+    return n;
+}
+H(user_LoadStringW) { return load_string(c, a, 1); }
+H(user_LoadStringA) { return load_string(c, a, 0); }
+
+/* GetFileTime(h, creation*, access*, write*) */
+H(k32_GetFileTime) {
+    RtFile *f = rt_handle_get(a[0], RT_H_FILE);
+    struct stat st;
+    if (!f || fstat(f->fd, &st) != 0) {
+        rt_set_last_error(c, 6);
+        return 0;
+    }
+    if (a[1]) st64(a[1], filetime_of(st.st_ctime));
+    if (a[2]) st64(a[2], filetime_of(st.st_atime));
+    if (a[3]) st64(a[3], filetime_of(st.st_mtime));
+    return 1;
+}
 
 static const ImportDef defs[] = {
     {"kernel32.dll", "CreateFileA", k32_CreateFileA, 7, 0},
@@ -696,6 +814,12 @@ static const ImportDef defs[] = {
     {"kernel32.dll", "FindClose", k32_FindClose, 1, 0},
     {"kernel32.dll", "GetSystemDirectoryA", k32_GetSystemDirectoryA, 2, 0},
     {"kernel32.dll", "FindResourceA", k32_FindResourceA, 3, 0},
+    {"kernel32.dll", "FindResourceW", k32_FindResourceW, 3, 0},
+    {"kernel32.dll", "FindResourceExW", k32_FindResourceExW, 4, 0},
+    {"kernel32.dll", "FreeResource", k32_FreeResource, 1, 0},
+    {"kernel32.dll", "GetFileTime", k32_GetFileTime, 4, 0},
+    {"user32.dll", "LoadStringW", user_LoadStringW, 4, 0},
+    {"user32.dll", "LoadStringA", user_LoadStringA, 4, 0},
     {"kernel32.dll", "FindResourceExA", k32_FindResourceExA, 4, 0},
     {"kernel32.dll", "LoadResource", k32_LoadResource, 2, 0},
     {"kernel32.dll", "SizeofResource", k32_SizeofResource, 2, 0},
