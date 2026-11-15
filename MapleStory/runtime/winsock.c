@@ -506,6 +506,58 @@ H(ws_recv) {
     return (uint32_t)r;
 }
 
+/* WSASend/WSARecv(s, lpBuffers, count, lpNumBytes, flags, overlapped, completion).
+ * The overlapped and completion-routine forms are not used by the client (it
+ * takes FD_READ/FD_WRITE notifications through WSAAsyncSelect); these handle the
+ * synchronous path, scattering/gathering over the array of WSABUF {len, buf}.
+ * Return 0 on success (bytes in *lpNumBytes), SOCKET_ERROR on failure. */
+H(ws_WSARecv) {
+    int fd = sock_fd(a[0], NULL);
+    if (fd < 0) return fail(c, WSAENOTSOCK);
+    uint32_t total = 0;
+    int got_any = 0;
+    for (uint32_t i = 0; i < a[2]; i++) {
+        uint32_t buf = a[1] + 8 * i, len = ld32(buf), ptr = ld32(buf + 4);
+        if (!len) continue;
+        ssize_t r = recv(fd, G(ptr), len, 0);
+        if (r < 0) {
+            int e = errno;
+            rearm(a[0], FD_READ);
+            if (got_any) break;
+            return fail(c, wsa_error(e));
+        }
+        got_any = 1;
+        total += (uint32_t)r;
+        if ((uint32_t)r < len) break; /* no more available now */
+    }
+    rearm(a[0], FD_READ);
+    if (a[3]) st32(a[3], total);
+    if (a[4]) st32(a[4], 0);
+    trace_io("WSARecv", a[0], NULL, a[1], total);
+    return 0;
+}
+H(ws_WSASend) {
+    int fd = sock_fd(a[0], NULL);
+    if (fd < 0) return fail(c, WSAENOTSOCK);
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < a[2]; i++) {
+        uint32_t buf = a[1] + 8 * i, len = ld32(buf), ptr = ld32(buf + 4);
+        if (!len) continue;
+        ssize_t r = send(fd, G(ptr), len, MSG_NOSIGNAL);
+        if (r < 0) {
+            int e = errno;
+            if (e == EAGAIN) rearm(a[0], FD_WRITE);
+            if (total) break;
+            return fail(c, wsa_error(e));
+        }
+        total += (uint32_t)r;
+        if ((uint32_t)r < len) break;
+    }
+    if (a[3]) st32(a[3], total);
+    trace_io("WSASend", a[0], NULL, a[1], total);
+    return 0;
+}
+
 H(ws_sendto) {
     Sock info;
     int fd = sock_fd(a[0], &info);
@@ -789,6 +841,8 @@ static const ImportDef defs[] = {
     {"ws2_32.dll", "accept", ws_accept, 3, 0},
     {"ws2_32.dll", "send", ws_send, 4, 0},
     {"ws2_32.dll", "recv", ws_recv, 4, 0},
+    {"ws2_32.dll", "WSARecv", ws_WSARecv, 7, 0},
+    {"ws2_32.dll", "WSASend", ws_WSASend, 7, 0},
     {"ws2_32.dll", "sendto", ws_sendto, 6, 0},
     {"ws2_32.dll", "recvfrom", ws_recvfrom, 6, 0},
     {"ws2_32.dll", "shutdown", ws_shutdown, 2, 0},
