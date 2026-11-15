@@ -804,6 +804,27 @@
         mov [edx+8], eax
         ret
 
+        FN t_xlat                   /* xlatb: AL = [EBX + AL] (msvcrt's x87 helpers); a table on the stack */
+        mov edx, OUT
+        mov ecx, B
+        mov eax, A
+        push ebx
+        push ecx                    /* table bytes 12..15 */
+        xor ecx, eax
+        push ecx                    /* 8..11 */
+        not ecx
+        push ecx                    /* 4..7 */
+        rol ecx, 7
+        push ecx                    /* 0..3 */
+        mov ebx, esp
+        and eax, 15
+        or eax, 0x12345600          /* the upper bits must survive */
+        xlatb
+        mov [edx], eax
+        add esp, 16
+        pop ebx
+        ret
+
         FN t_wide_arith             /* 64-bit add/sub/neg/shift from 32-bit pieces: (b:a) op (d:c) */
         mov ecx, OUT
         mov eax, A
