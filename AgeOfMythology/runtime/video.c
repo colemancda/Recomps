@@ -700,7 +700,14 @@ static void sdl_open(const char *title, int width, int height) {
     }
     if (g_opt.fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, flags);
-    if (window) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    /* Direct3D draws with its own EGL context on this thread (d3d8gl.c); a thread
+     * cannot also hold SDL's GLX context, so the window then uses SDL's software
+     * renderer: the frames arrive as plain pixels anyway. */
+    int gl_in_use = !getenv("RECOMP_NO_GL");
+    /* and SDL must not back that window surface with a GL renderer of its own */
+    if (gl_in_use) SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+    if (window && !gl_in_use)
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (window && !renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     if (!window || !renderer) {
         rt_log("recomp: cannot create the SDL window (%s); continuing without one\n", SDL_GetError());
@@ -711,7 +718,6 @@ static void sdl_open(const char *title, int width, int height) {
     SDL_StartTextInput();
     have_window = 1;
     view_update();
-    if (g_opt.fullscreen) SDL_ShowCursor(SDL_DISABLE); /* the game draws its own */
     pads_open();
     rt_affinity_host(0);
     SDL_RendererInfo info;
@@ -745,7 +751,9 @@ static void dump_window(unsigned frame) {
     free(rgb);
 }
 
+static void cursor_apply(void);
 static void sdl_flush(void) {
+    cursor_apply();
     pthread_mutex_lock(&frame_mu);
     if (frame_dirty && frame_px) {
         if (!texture || tex_w != frame_w || tex_h != frame_h) {
@@ -998,6 +1006,68 @@ void rt_video_message_box(const char *caption, const char *text) { (void)caption
 
 #endif
 
+/* ---------------------------------------------------------------- cursors */
+typedef struct CursorShape {
+    uint32_t *argb;
+    int w, h, hx, hy;
+#ifndef RT_NO_SDL
+    SDL_Cursor *sdl;
+#endif
+} CursorShape;
+static CursorShape cursors[256];
+static int ncursors;
+static pthread_mutex_t cursor_mu = PTHREAD_MUTEX_INITIALIZER;
+static int cursor_want = RT_CURSOR_SYSTEM; /* SDL_SYSTEM_CURSOR_ARROW */
+static int cursor_shown_id = -1;
+
+int rt_video_cursor_create(const uint32_t *argb, int w, int h, int hot_x, int hot_y) {
+    if (w <= 0 || h <= 0 || w > 256 || h > 256) return -1;
+    uint32_t *copy = malloc((size_t)w * (size_t)h * 4);
+    if (!copy) return -1;
+    memcpy(copy, argb, (size_t)w * (size_t)h * 4);
+    pthread_mutex_lock(&cursor_mu);
+    int id = ncursors < (int)RT_COUNTOF(cursors) ? ncursors++ : -1;
+    if (id >= 0) cursors[id] = (CursorShape){.argb = copy, .w = w, .h = h, .hx = hot_x, .hy = hot_y};
+    pthread_mutex_unlock(&cursor_mu);
+    if (id < 0) free(copy);
+    return id;
+}
+
+void rt_video_set_cursor(int id) { __atomic_store_n(&cursor_want, id, __ATOMIC_RELAXED); }
+
+#ifndef RT_NO_SDL
+/* The selected shape on the window; video thread. */
+static void cursor_apply(void) {
+    int id = __atomic_load_n(&cursor_want, __ATOMIC_RELAXED);
+    if (id == cursor_shown_id) return;
+    SDL_Cursor *cur = NULL;
+    static SDL_Cursor *system[SDL_NUM_SYSTEM_CURSORS];
+    if (id >= RT_CURSOR_SYSTEM && id < RT_CURSOR_SYSTEM + SDL_NUM_SYSTEM_CURSORS) {
+        int k = id - RT_CURSOR_SYSTEM;
+        if (!system[k]) system[k] = SDL_CreateSystemCursor((SDL_SystemCursor)k);
+        cur = system[k];
+    } else {
+        pthread_mutex_lock(&cursor_mu);
+        CursorShape *cs = id >= 0 && id < ncursors ? &cursors[id] : NULL;
+        if (cs && !cs->sdl) {
+            SDL_Surface *sf = SDL_CreateRGBSurfaceWithFormatFrom(cs->argb, cs->w, cs->h, 32, cs->w * 4,
+                                                                 SDL_PIXELFORMAT_ARGB8888);
+            if (sf) {
+                cs->sdl = SDL_CreateColorCursor(sf, cs->hx, cs->hy);
+                SDL_FreeSurface(sf);
+            }
+            if (!cs->sdl) rt_log("recomp: cursor %d: %s\n", id, SDL_GetError());
+        }
+        cur = cs ? cs->sdl : NULL;
+        pthread_mutex_unlock(&cursor_mu);
+    }
+    if ((id == RT_CURSOR_NONE) != (cursor_shown_id == RT_CURSOR_NONE))
+        SDL_ShowCursor(id == RT_CURSOR_NONE ? SDL_DISABLE : SDL_ENABLE);
+    cursor_shown_id = id;
+    if (cur) SDL_SetCursor(cur);
+}
+#endif
+
 /* The calling thread becomes the video thread, with or without a window. */
 void rt_video_open(const char *title, int width, int height) {
     screen_w = width;
@@ -1031,6 +1101,13 @@ int rt_video_poll(RtInputEvent *ev) {
 
 void rt_video_present(const void *pixels, int width, int height, int pitch, int is555) {
     pthread_mutex_lock(&frame_mu);
+    /* The guest screen is what the game presents: a Direct3D back buffer can be larger
+     * than the display mode the window was opened for. Mouse positions follow it. */
+    if (width != screen_w || height != screen_h) {
+        if (g_opt.verbose) rt_log("recomp: guest screen %dx%d -> %dx%d\n", screen_w, screen_h, width, height);
+        screen_w = width;
+        screen_h = height;
+    }
     if (!frame_px || frame_w != width || frame_h != height) {
         free(frame_px);
         frame_px = malloc((size_t)width * (size_t)height * 2);
