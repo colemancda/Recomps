@@ -1,10 +1,12 @@
 /* PE32 loader: maps the EXE and the lifted DLLs into guest memory, relocates a DLL
  * that was lifted away from its preferred base, links imports between lifted
  * images directly and points every other IAT slot at a fake host-function address. */
+#include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "rt.h"
 
@@ -63,7 +65,7 @@ static const RtImageDesc *desc_named(const char *name) {
 
 RtImage *rt_image_named(const char *name) {
     for (unsigned i = 0; i < g_ndlls; i++)
-        if (same_module(g_dlls[i].desc->name, name)) return &g_dlls[i];
+        if (same_module(g_dlls[i].name, name)) return &g_dlls[i];
     return NULL;
 }
 
@@ -127,11 +129,19 @@ static void relocate(RtImage *im, uint32_t pref, uint32_t rva, uint32_t size) {
         }
         p += bsize;
     }
-    if (g_opt.verbose) rt_log("[loader] %s: %u relocations applied (base %08x -> %08x)\n", im->desc->name, n, pref,
+    if (g_opt.verbose) rt_log("[loader] %s: %u relocations applied (base %08x -> %08x)\n", im->name, n, pref,
                               im->base);
 }
 
 static RtImage *load_dll(const char *name, int depth);
+
+/* The directory of the running program: system DLLs it lifts (msxml4) sit there. */
+static void program_dir(char *out, size_t cap) {
+    ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+    out[n > 0 ? n : 0] = 0;
+    char *slash = strrchr(out, '/');
+    if (slash) *slash = 0;
+}
 
 /* Point the IAT of `im` at lifted exports or fake host addresses. */
 static void resolve_imports(RtImage *im, uint32_t imp_rva, int depth) {
@@ -158,7 +168,7 @@ static void resolve_imports(RtImage *im, uint32_t imp_rva, int depth) {
             if (dep) {
                 uint32_t a = rt_image_export(dep, name, ord);
                 if (!a) {
-                    fprintf(stderr, "recomp: %s imports %s!%s, which it does not export\n", im->desc->name, dll,
+                    fprintf(stderr, "recomp: %s imports %s!%s, which it does not export\n", im->name, dll,
                             name ? name : ordname);
                     exit(2);
                 }
@@ -189,6 +199,7 @@ static void map_image(RtImage *im, const RtImageDesc *desc, const char *path, in
     uint32_t pref = f32(oh + 28);
 
     im->desc = desc;
+    snprintf(im->name, sizeof im->name, "%s", desc->name);
     im->base = desc->base;
     im->size = (f32(oh + 56) + 0xFFFu) & ~0xFFFu; /* Windows maps whole pages */
     im->entry = im->base + f32(oh + 16);
@@ -249,8 +260,11 @@ static RtImage *load_dll(const char *name, int depth) {
     if (!desc) return NULL;
     if (depth > 8 || g_ndlls == RT_MAX_DLLS) die("too many lifted DLLs, or an import cycle", desc->name);
     char path[512];
+    char self[512];
+    program_dir(self, sizeof self);
+    /* The game's DLLs are in its folder; system DLLs the program lifts (msxml4) next to the program. */
     if (!find_file(g_opt.gamedir, desc->name, path, sizeof path) &&
-        !find_file(g_opt.exedir, desc->name, path, sizeof path)) {
+        !find_file(g_opt.exedir, desc->name, path, sizeof path) && !find_file(self, desc->name, path, sizeof path)) {
         fprintf(stderr, "recomp: lifted DLL %s not found in %s\n", desc->name, g_opt.gamedir);
         exit(2);
     }
@@ -273,6 +287,61 @@ static RtImage *load_dll(const char *name, int depth) {
 }
 
 RtImage *rt_load_dll(const char *name) { return load_dll(name, 0); }
+
+RtImage *rt_load_data_dll(const char *name) {
+    RtImage *im = rt_image_named(name);
+    if (im) return im;
+    char path[512];
+    char self[512];
+    program_dir(self, sizeof self);
+    if (g_ndlls == RT_MAX_DLLS || (!find_file(g_opt.gamedir, base_name(name), path, sizeof path) &&
+                                   !find_file(self, base_name(name), path, sizeof path)))
+        return NULL;
+    long fsize;
+    uint8_t *file = read_file(path, &fsize);
+    if (!file) return NULL;
+    uint32_t pe = fsize > 0x40 ? f32(file + 0x3C) : 0;
+    if (fsize < 0x200 || f16(file) != 0x5A4D || pe + 0x108 > (uint32_t)fsize || f32(file + pe) != 0x4550) {
+        free(file);
+        return NULL;
+    }
+    const uint8_t *fh = file + pe + 4, *oh = fh + 20;
+    if (f32(oh + 96 + 4)) { /* it has exports: code the recompilation does not have */
+        free(file);
+        return NULL;
+    }
+    uint32_t size = (f32(oh + 56) + 0xFFFu) & ~0xFFFu;
+    uint32_t base = rt_valloc(0, size, 0x3000, 4);
+    if (!base) {
+        free(file);
+        return NULL;
+    }
+    im = &g_dlls[g_ndlls++];
+    memset(im, 0, sizeof *im);
+    snprintf(im->name, sizeof im->name, "%s", base_name(name));
+    for (char *p = im->name; *p; p++) *p = (char)tolower((unsigned char)*p);
+    snprintf(im->path, sizeof im->path, "%s", path);
+    snprintf(im->guest_path, sizeof im->guest_path, "%s", name);
+    im->base = base;
+    im->size = size;
+    im->entry = base;
+    im->attached = 1;
+    uint32_t hs = f32(oh + 60) < (uint32_t)fsize ? f32(oh + 60) : (uint32_t)fsize;
+    memcpy(G(base), file, hs);
+    const uint8_t *sh = oh + f16(fh + 16);
+    for (unsigned i = 0; i < f16(fh + 2); i++, sh += 40) {
+        uint32_t vsize = f32(sh + 8), va = f32(sh + 12), rawsize = f32(sh + 16), raw = f32(sh + 20);
+        uint32_t n = rawsize < vsize || vsize == 0 ? rawsize : vsize;
+        if (raw >= (uint32_t)fsize || (uint64_t)va + n > size) continue;
+        if (raw + n > (uint32_t)fsize) n = (uint32_t)fsize - raw;
+        memcpy(G(base + va), file + raw, n);
+    }
+    im->rsrc_rva = f32(oh + 96 + 2 * 8);
+    im->rsrc_size = f32(oh + 96 + 2 * 8 + 4);
+    free(file);
+    if (g_opt.verbose || g_trace_imports) rt_log("[loader] %s mapped as data at %08x\n", im->name, base);
+    return im;
+}
 
 RtImage *rt_image_of(uint32_t addr) {
     if (g_image.size && addr - g_image.base < g_image.size) return &g_image;
@@ -340,10 +409,10 @@ int rt_dll_attach(CPU *c) {
         im->attached = 1;
         if (im->entry == im->base) continue; /* no entry point */
         uint32_t args[3] = {im->base, 1 /* DLL_PROCESS_ATTACH */, 1 /* static load */}, r = 0;
-        if (g_opt.verbose || g_trace_imports) rt_log("[loader] DllMain(%s, PROCESS_ATTACH)\n", im->desc->name);
+        if (g_opt.verbose || g_trace_imports) rt_log("[loader] DllMain(%s, PROCESS_ATTACH)\n", im->name);
         if (!rt_call_guest(c, im->entry, RT_STDCALL, 3, args, &r)) return 0;
         if (!r) {
-            rt_log("recomp: DllMain of %s returned FALSE\n", im->desc->name);
+            rt_log("recomp: DllMain of %s returned FALSE\n", im->name);
             return 0;
         }
     }
