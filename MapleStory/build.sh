@@ -29,27 +29,39 @@ opt="${OPT:--O1}"
 
 # module  file           lift base (empty: the PE's own)   function list (optional)   hooks
 # The EXE comes first: the runtime takes rt_images[0] as the program. The engine
-# DLLs (Canvas, Gr2D_DX8, Sound_DX8, NameSpace, PCOM, ResMan, Shape2D) and the
-# data DLLs (WzMss, ijl15) are added here as the boot reaches them; until then
-# the runtime stubs their imports. GameGuard (npkcrypt) is always stubbed.
+# DLLs (PCOM, NameSpace, ResMan, Shape2D, Canvas, Gr2D_DX8, Sound_DX8) are loaded
+# by the client at start-up; ijl15 decodes the .wz JPEGs. WzMss and GameGuard
+# (npkcrypt) are stubbed in the runtime. Each DLL keeps its own ImageBase.
 modules=(
-    "msmain   GMSv62.exe   -   $build/survey/GMSv62.functions.csv   -"
+    "msmain    GMSv62.exe      -   $build/survey/GMSv62.functions.csv     -"
+    "msvcrt    msvcrt.dll      -   $build/survey/msvcrt.functions.csv      -"
+    "pcom      PCOM.dll        -   $build/survey/PCOM.functions.csv        -"
+    "namespace NameSpace.dll   -   $build/survey/NameSpace.functions.csv   -"
+    "resman    ResMan.dll      -   $build/survey/ResMan.functions.csv      -"
+    "shape2d   Shape2D.dll     -   $build/survey/Shape2D.functions.csv     -"
+    "canvas    Canvas.dll      -   $build/survey/Canvas.functions.csv      -"
+    "gr2d      Gr2D_DX8.dll    -   $build/survey/Gr2D_DX8.functions.csv    -"
+    "sounddx8  Sound_DX8.dll   -   $build/survey/Sound_DX8.functions.csv   -"
+    "ijl15     ijl15.dll       -   $build/survey/ijl15.functions.csv       -"
 )
 
-# The function list is Ghidra's export (build/survey/GMSv62.ghidra.csv) plus the
-# code-pointer targets in .data/.rdata that Ghidra misses (the CRT initialiser
-# table and the engine vtables), appended by tools/data_code_pointers.py. Without
-# these the client faults in _initterm at the first static constructor.
-ghidra_csv="$build/survey/GMSv62.ghidra.csv"
-merged_csv="$build/survey/GMSv62.functions.csv"
-if [ -f "$ghidra_csv" ]; then
+# Each function list is Ghidra's export (<stem>.ghidra.csv) plus the code-pointer
+# targets in .data/.rdata that Ghidra misses (the CRT initialiser table and the
+# C++ vtables), appended by tools/data_code_pointers.py. Without these the EXE
+# faults in _initterm at the first static constructor, and the engine DLLs miss
+# their indirectly-called vtable methods.
+for line in "${modules[@]}"; do
+    read -r _ file _ merged_csv _ <<<"$line"
+    [ -n "$merged_csv" ] && [ "$merged_csv" != - ] || continue
+    ghidra_csv="${merged_csv%.functions.csv}.ghidra.csv"
+    [ -f "$ghidra_csv" ] || continue
     if [ ! -f "$merged_csv" ] || [ "$ghidra_csv" -nt "$merged_csv" ] || \
        [ "$here/tools/data_code_pointers.py" -nt "$merged_csv" ]; then
-        echo "== merging data-section code pointers into the function list"
+        echo "== merging data-section code pointers for $file"
         cp "$ghidra_csv" "$merged_csv"
-        python3 "$here/tools/data_code_pointers.py" "$orig/GMSv62.exe" "$ghidra_csv" >>"$merged_csv"
+        python3 "$here/tools/data_code_pointers.py" "$orig/$file" "$ghidra_csv" >>"$merged_csv"
     fi
-fi
+done
 
 case "$target" in
 host) cc="${CC:-gcc}" ;;
