@@ -1699,6 +1699,15 @@ static uint32_t dlg_field(uint32_t p, char *out, size_t cap) {
     if (out) rt_get_wstr(p, out, cap);
     return p + 2 * (rt_wlen(p) + 1);
 }
+/* DialogBoxParamA/W(hinst, templateName, parent, proc, param): a modal dialog
+ * from a resource template. Not shown; the answer is IDOK. (MapleStory's real
+ * interface is its own Direct3D window, not a dialog.) */
+H(user_DialogBoxParam) {
+    UNUSED;
+    if (g_opt.verbose) rt_log("[user] DialogBoxParam template %#x answered IDOK\n", a[1]);
+    return 1; /* IDOK */
+}
+
 /* DialogBoxIndirectParamW(hinst, template, parent, proc, param). Dialogs cannot be
  * shown: the template's title and texts are logged and the answer is IDOK. */
 H(user_DialogBoxIndirectParamW) {
@@ -1835,6 +1844,10 @@ static const ImportDef defs[] = {
     {"user32.dll", "GetMenu", user_false, 1, 0},
     {"user32.dll", "DestroyMenu", user_true, 1, 0},
     {"user32.dll", "EndDialog", user_true, 2, 0},
+    {"user32.dll", "FindWindowA", user_false, 2, 0},
+    {"user32.dll", "FindWindowW", user_false, 2, 0},
+    {"user32.dll", "DialogBoxParamA", user_DialogBoxParam, 5, 0},
+    {"user32.dll", "DialogBoxParamW", user_DialogBoxParam, 5, 0},
     {"user32.dll", "DialogBoxIndirectParamW", user_DialogBoxIndirectParamW, 5, 0},
     {"user32.dll", "GetDlgItem", user_false, 2, 0},
     {"user32.dll", "GetScrollPos", user_false, 2, 0},
