@@ -506,43 +506,55 @@ H(oa_VariantCopyInd) {
     }
     return 0;
 }
-/* VariantChangeType(dst, src, flags, vt): the conversions to and from strings and integers. */
+/* VariantChangeType(dst, src, flags, vt): conversions among the numeric types
+ * (and strings). The login UI computes element positions and sizes as floats and
+ * doubles routed through VARIANTs, so the real types interconvert with the
+ * integer ones here; a conversion left unprovided leaves the destination
+ * unchanged, which gives a UI element the wrong coordinate. Object (VT_UNKNOWN /
+ * VT_DISPATCH) and error (VT_ERROR) sources are deliberately NOT converted: the
+ * caller uses that failure to tell an object apart from a number. */
 H(oa_VariantChangeType) {
     uint16_t from = ld16(a[1]), to = (uint16_t)a[3];
-    uint8_t val[8];
-    memcpy(val, G(a[1] + 8), 8);
     if (from == to) return oa_VariantCopy(c, (uint32_t[]){a[0], a[1]});
     char s[64];
-    int64_t iv = 0;
-    int have_int = 1;
+    double dv = 0; /* the source as a number (exact for every type used here) */
+    int have = 1;
     switch (from) {
-    case 0: case 1: iv = 0; break;                                  /* VT_EMPTY, VT_NULL -> 0 */
-    case 2: iv = (int16_t)(val[0] | val[1] << 8); break;            /* VT_I2 */
-    case 3: case 22: iv = (int32_t)ld32(a[1] + 8); break;           /* VT_I4, VT_INT */
-    case 11: iv = (val[0] | val[1]) ? -1 : 0; break;                /* VT_BOOL */
-    case 17: iv = val[0]; break;                                    /* VT_UI1 */
-    case 19: case 23: iv = ld32(a[1] + 8); break;                   /* VT_UI4, VT_UINT */
+    case 0: case 1: dv = 0; break;                                 /* VT_EMPTY, VT_NULL */
+    case 2: dv = (int16_t)ld16(a[1] + 8); break;                   /* VT_I2 */
+    case 3: case 22: dv = (int32_t)ld32(a[1] + 8); break;          /* VT_I4, VT_INT */
+    case 4: { float f; memcpy(&f, G(a[1] + 8), 4); dv = f; break; }       /* VT_R4 */
+    case 5: case 7: { double d; memcpy(&d, G(a[1] + 8), 8); dv = d; break; } /* VT_R8, VT_DATE */
+    case 11: dv = ld16(a[1] + 8) ? 1 : 0; break;                   /* VT_BOOL */
+    case 17: dv = ld8(a[1] + 8); break;                            /* VT_UI1 */
+    case 18: dv = ld16(a[1] + 8); break;                           /* VT_UI2 */
+    case 19: case 23: dv = (double)ld32(a[1] + 8); break;          /* VT_UI4, VT_UINT */
     case VT_BSTR:
         rt_get_wstr(ld32(a[1] + 8), s, sizeof s);
-        iv = strtoll(s, NULL, 0);
+        dv = strtod(s, NULL);
         break;
-    default: have_int = 0;
+    default: have = 0;
     }
-    if (!have_int) {
+    if (!have) {
         rt_log("[oleaut32] VariantChangeType %u -> %u not provided\n", from, to);
         return 0x80020005u; /* DISP_E_TYPEMISMATCH */
     }
+    int64_t iv = (int64_t)(dv < 0 ? dv - 0.5 : dv + 0.5); /* round to nearest for integer targets */
     uint32_t args[1] = {a[0]};
     if (a[0] != a[1]) oa_VariantClear(c, args);
     memset(G(a[0]), 0, 16);
     st16(a[0], to);
     switch (to) {
-    case 2: st16(a[0] + 8, (uint16_t)iv); break;
-    case 3: case 22: case 19: case 23: st32(a[0] + 8, (uint32_t)iv); break;
-    case 11: st16(a[0] + 8, iv ? 0xFFFF : 0); break;
-    case 17: st8(a[0] + 8, (uint8_t)iv); break;
+    case 2: st16(a[0] + 8, (uint16_t)iv); break;                   /* VT_I2 */
+    case 3: case 22: case 19: case 23: st32(a[0] + 8, (uint32_t)iv); break; /* I4/INT/UI4/UINT */
+    case 4: { float f = (float)dv; memcpy(G(a[0] + 8), &f, 4); break; }     /* VT_R4 */
+    case 5: case 7: { double d = dv; memcpy(G(a[0] + 8), &d, 8); break; }   /* VT_R8, VT_DATE */
+    case 11: st16(a[0] + 8, dv != 0 ? 0xFFFF : 0); break;          /* VT_BOOL */
+    case 17: st8(a[0] + 8, (uint8_t)iv); break;                    /* VT_UI1 */
+    case 18: st16(a[0] + 8, (uint16_t)iv); break;                  /* VT_UI2 */
     case VT_BSTR: {
-        snprintf(s, sizeof s, "%lld", (long long)iv);
+        if (dv == (double)iv) snprintf(s, sizeof s, "%lld", (long long)iv);
+        else snprintf(s, sizeof s, "%g", dv);
         uint32_t w = rt_wstr_dup(s);
         st32(a[0] + 8, bstr_alloc(w, 2 * rt_wlen(w)));
         rt_heap_free(w);
