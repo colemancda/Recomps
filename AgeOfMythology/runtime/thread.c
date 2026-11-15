@@ -188,7 +188,8 @@ int rt_handle_close(uint32_t h) {
 struct RtWaitable {
     int kind;
     int refs;
-    int signaled;     /* event: set; thread/process: exited; mutex: unused (see owner) */
+    int signaled;     /* event: set; thread/process: exited; semaphore: the count; mutex: unused (see owner) */
+    int max_count;    /* semaphore */
     int manual_reset; /* events */
     uint32_t owner;   /* mutex: owning thread id, 0 when free */
     uint32_t recursion;
@@ -272,6 +273,8 @@ static void waitable_acquire(RtWaitable *w, uint32_t tid) {
         w->recursion++;
     } else if (w->kind == RT_W_EVENT && !w->manual_reset) {
         w->signaled = 0;
+    } else if (w->kind == RT_W_SEMAPHORE) {
+        w->signaled--;
     }
 }
 
@@ -410,6 +413,47 @@ H(k32_CreateMutexA) {
     }
     rt_set_last_error(c, err);
     return rt_handle_alloc(RT_H_WAITABLE, w, rt_waitable_unref);
+}
+
+/* CreateSemaphoreA(security, initial, maximum, name) */
+H(k32_CreateSemaphoreA) {
+    pthread_once(&sync_once, sync_init);
+    RtWaitable *w = NULL;
+    uint32_t err = 0;
+    if ((int32_t)a[2] <= 0 || a[1] > a[2]) {
+        rt_set_last_error(c, 87);
+        return 0;
+    }
+    if (a[3] && (w = named_find(rt_gstr(a[3]), RT_W_SEMAPHORE)) != NULL) {
+        err = ERROR_ALREADY_EXISTS;
+    } else {
+        w = rt_waitable_new(RT_W_SEMAPHORE, 0, (int)a[1]);
+        w->max_count = (int)a[2];
+        if (a[3]) named_add(w, rt_gstr(a[3]));
+    }
+    rt_set_last_error(c, err);
+    return rt_handle_alloc(RT_H_WAITABLE, w, rt_waitable_unref);
+}
+H(k32_CreateSemaphoreW) { return rt_call_a(c, a, 4, "kernel32.dll", "CreateSemaphoreA", 8); }
+
+/* ReleaseSemaphore(h, count, &previous) */
+H(k32_ReleaseSemaphore) {
+    RtWaitable *w = rt_handle_get(a[0], RT_H_WAITABLE);
+    if (!w || w->kind != RT_W_SEMAPHORE) {
+        rt_set_last_error(c, ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    uint32_t ok = 0;
+    pthread_mutex_lock(&sync_mu);
+    if ((int32_t)a[1] > 0 && w->signaled + (int)a[1] <= w->max_count) {
+        if (a[2]) st32(a[2], (uint32_t)w->signaled);
+        w->signaled += (int)a[1];
+        pthread_cond_broadcast(&sync_cv);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&sync_mu);
+    if (!ok) rt_set_last_error(c, 298); /* ERROR_TOO_MANY_POSTS */
+    return ok;
 }
 
 H(k32_ReleaseMutex) {
@@ -881,6 +925,9 @@ H(k32_TlsSetValue) {
 }
 
 static const ImportDef defs[] = {
+    {"kernel32.dll", "CreateSemaphoreA", k32_CreateSemaphoreA, 4, 0},
+    {"kernel32.dll", "CreateSemaphoreW", k32_CreateSemaphoreW, 4, 0},
+    {"kernel32.dll", "ReleaseSemaphore", k32_ReleaseSemaphore, 3, 0},
     {"kernel32.dll", "CreateEventA", k32_CreateEventA, 4, 0},
     {"kernel32.dll", "OpenEventA", k32_OpenEventA, 3, 0},
     {"kernel32.dll", "SetEvent", k32_SetEvent, 1, 0},
