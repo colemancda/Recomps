@@ -12,8 +12,13 @@ const RtHook rt_hooks[] = {{0}};
 const unsigned rt_nhooks = 0;
 
 /* GameGuard / nProtect KeyCrypt (npkcrypt.dll). The anti-cheat driver is not
- * loaded; every entry point reports success so the client proceeds. */
-H(npk_open) { UNUSED; return 0; }              /* NPKOpenDriver: 0 = ok */
+ * loaded; every entry point reports success so the client proceeds. The
+ * KeyCrypt init (FUN_00867060) stores NPKOpenDriver's return and throws
+ * CSecurityKeyCryptInitFailed if it is <= 0, so NPKOpenDriver must report a
+ * positive handle; and it treats NPKGetAppCompatFlag == -1 as "compatible, no
+ * action", so that returns -1 to skip the app-compat error path. */
+H(npk_open) { UNUSED; return 1; }              /* NPKOpenDriver: a positive handle = ok */
+H(npk_compat_ok) { UNUSED; return 0xFFFFFFFFu; } /* NPKGetAppCompatFlag: -1 = compatible */
 H(npk_ok) { UNUSED; return 1; }
 H(npk_zero) { UNUSED; return 0; }
 H(npk_msg) { UNUSED; return 0x8000; }          /* NPKRegisterCryptWindowMsg: a message id */
@@ -27,7 +32,7 @@ static const ImportDef defs[] = {
     {"npkcrypt.dll", "NPKCloseDriver", npk_zero, 0, 0},
     {"npkcrypt.dll", "NPKLoadAtStartup", npk_ok, 1, 0},
     {"npkcrypt.dll", "NPKSetDrvPath", npk_ok, 1, 0},
-    {"npkcrypt.dll", "NPKGetAppCompatFlag", npk_zero, 0, 0},
+    {"npkcrypt.dll", "NPKGetAppCompatFlag", npk_compat_ok, 0, 0},
     {"npkcrypt.dll", "NPKSetAppCompatFlag", npk_zero, 1, 0},
     {"npkcrypt.dll", "NPKRegisterCryptWindowMsg", npk_msg, 1, 0},
 
