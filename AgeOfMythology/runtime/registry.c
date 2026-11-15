@@ -1,14 +1,14 @@
 /* advapi32 registry, backed by a text file in the format of a .reg export:
  *
- *   [HKEY_CURRENT_USER\Software\Softnyx\GunBound]
- *   "Location"="C:\\GunBound"
- *   "Version"=dword:00000118
+ *   [HKEY_CURRENT_USER\Software\Microsoft\Microsoft Games\Age of Mythology Expansion Pack\1.0]
+ *   "SystemInitialization"="1"
+ *   "FIRSTRUN"=dword:00000001
  *   "Blob"=hex:01,02,03
  *
  * The file is read at the first registry call and rewritten whenever the guest
- * changes a value. When it does not exist it is created with the two values the
- * game cannot start without (its install location and its client version) and
- * the settings its launcher provisions. --broker overrides the server address.
+ * changes a value. When it does not exist it is created with the key the
+ * installer makes; the game writes everything else itself. Strings are kept
+ * as UTF-8; the W functions convert.
  */
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -38,7 +38,7 @@ typedef struct RegValue {
 } RegValue;
 
 typedef struct RegKey {
-    char *path; /* e.g. HKEY_CURRENT_USER\Software\Softnyx\GunBound */
+    char *path; /* e.g. HKEY_CURRENT_USER\Software\Microsoft\Microsoft Games\... */
     RegValue *values;
     struct RegKey *next;
 } RegKey;
@@ -101,7 +101,7 @@ static void reg_save(void) {
         rt_log("recomp: cannot write the registry file %s\n", g_opt.regfile);
         return;
     }
-    fprintf(f, "; Registry of the recompiled GunBound client. Edit while the game is not running.\n");
+    fprintf(f, "; Registry of the recompiled game. Edit while the game is not running.\n");
     for (RegKey *k = keys; k; k = k->next) {
         fprintf(f, "\n[%s]\n", k->path);
         for (RegValue *v = k->values; v; v = v->next) {
@@ -147,53 +147,19 @@ static char *parse_quoted(char **pp) {
     return out;
 }
 
-static const char *const game_keys[] = {
-    "HKEY_CURRENT_USER\\Software\\Softnyx\\GunBound",
-    "HKEY_LOCAL_MACHINE\\Software\\Softnyx\\GunBound",
+/* What the installer creates (an empty key); the game adds its own values. */
+static const char *const install_keys[] = {
+    "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Microsoft Games\\Age of Mythology Expansion Pack\\1.0",
+    "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Microsoft Games\\Age of Mythology\\1.0",
 };
-
-/* --broker HOST[:PORT]: where the game looks for its server list. */
-static void apply_broker_option(void) {
-    if (!g_opt.broker[0]) return;
-    char host[sizeof g_opt.broker];
-    unsigned port = 8372;
-    snprintf(host, sizeof host, "%s", g_opt.broker);
-    char *colon = strrchr(host, ':');
-    if (colon) {
-        *colon = 0;
-        port = (unsigned)atoi(colon + 1);
-    }
-    for (size_t i = 0; i < RT_COUNTOF(game_keys); i++) {
-        RegKey *k = key_find(game_keys[i]);
-        if (!k) k = key_create(game_keys[i]);
-        set_sz(k, "IP", host);
-        set_sz(k, "BuddyIP", host);
-        set_dword(k, "Port", port);
-    }
-}
 
 static void reg_load(void) {
     if (loaded) return;
     loaded = 1;
     FILE *f = fopen(g_opt.regfile, "r");
     if (!f) {
-        /* What the game's launcher writes for a fresh installation. */
-        static const uint8_t one = 1, two = 2, zero = 0;
-        for (size_t i = 0; i < RT_COUNTOF(game_keys); i++) {
-            RegKey *k = key_create(game_keys[i]);
-            set_sz(k, "Location", "C:\\GunBound\\");
-            set_dword(k, "Version", 280);
-            set_dword(k, "AutoRefresh", 1);
-            value_set(k, "Background", REG_BINARY, &one, 1);
-            value_set(k, "Effect3D", REG_BINARY, &two, 1);
-            set_dword(k, "EffectVolume", 95);
-            set_dword(k, "MusicVolume", 95);
-            value_set(k, "MidiMode", REG_BINARY, &one, 1);
-            set_dword(k, "MouseSpeed", 50);
-            value_set(k, "ShootingMode", REG_BINARY, &zero, 1);
-        }
-        rt_log("recomp: no registry file at %s; created one with the launcher's default settings\n", g_opt.regfile);
-        apply_broker_option();
+        for (size_t i = 0; i < RT_COUNTOF(install_keys); i++) key_create(install_keys[i]);
+        rt_log("recomp: no registry file at %s; created one with the installer's keys\n", g_opt.regfile);
         reg_save();
         return;
     }
@@ -249,7 +215,6 @@ static void reg_load(void) {
         free(name);
     }
     fclose(f);
-    apply_broker_option();
 }
 
 /* Path of a key handle, or NULL. Under reg_mu. */
@@ -471,8 +436,235 @@ H(adv_RegEnumKeyExA) {
     return r;
 }
 
+/* ------------------------------------------------------------ W forms */
+#define REG_EXPAND_SZ 2u
+#define REG_MULTI_SZ 7u
+static int is_string(uint32_t type) { return type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ; }
+
+/* n UTF-16 units (NULs included) -> UTF-8 bytes; returns the length written. */
+static uint32_t w_to_utf8(uint32_t src, uint32_t n, char *out, uint32_t cap) {
+    uint32_t o = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t ch = ld16(src + 2 * i);
+        char tmp[4];
+        uint32_t k;
+        if (ch < 0x80) tmp[0] = (char)ch, k = 1;
+        else if (ch < 0x800) tmp[0] = (char)(0xC0 | ch >> 6), tmp[1] = (char)(0x80 | (ch & 0x3F)), k = 2;
+        else tmp[0] = (char)(0xE0 | ch >> 12), tmp[1] = (char)(0x80 | ((ch >> 6) & 0x3F)), tmp[2] = (char)(0x80 | (ch & 0x3F)), k = 3;
+        if (o + k > cap) break;
+        memcpy(out + o, tmp, k);
+        o += k;
+    }
+    return o;
+}
+/* UTF-8 bytes (NULs included) -> UTF-16 units into guest memory (dst 0: count only). */
+static uint32_t utf8_to_w(const uint8_t *p, uint32_t len, uint32_t dst) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < len;) {
+        uint32_t ch = p[i++];
+        if (ch >= 0xE0 && i + 1 < len) ch = ((ch & 0x0F) << 12) | ((p[i] & 0x3Fu) << 6) | (p[i + 1] & 0x3Fu), i += 2;
+        else if (ch >= 0xC0 && i < len) ch = ((ch & 0x1F) << 6) | (p[i] & 0x3Fu), i += 1;
+        if (dst) st16(dst + 2 * n, (uint16_t)ch);
+        n++;
+    }
+    return n;
+}
+
+H(adv_RegOpenKeyExW) { return rt_call_a(c, a, 5, "advapi32.dll", "RegOpenKeyExA", 2); }
+H(adv_RegOpenKeyA) {
+    uint32_t args[5] = {a[0], a[1], 0, 0x20019, a[2]};
+    return adv_RegOpenKeyExA(c, args);
+}
+H(adv_RegOpenKeyW) {
+    uint32_t args[5] = {a[0], a[1], 0, 0x20019, a[2]};
+    return rt_call_a(c, args, 5, "advapi32.dll", "RegOpenKeyExA", 2);
+}
+H(adv_RegCreateKeyExW) { return rt_call_a(c, a, 9, "advapi32.dll", "RegCreateKeyExA", 2 | 8); }
+H(adv_RegCreateKeyA) {
+    uint32_t args[9] = {a[0], a[1], 0, 0, 0, 0xF003F, 0, a[2], 0};
+    return adv_RegCreateKeyExA(c, args);
+}
+H(adv_RegCreateKeyW) {
+    uint32_t args[9] = {a[0], a[1], 0, 0, 0, 0xF003F, 0, a[2], 0};
+    return rt_call_a(c, args, 9, "advapi32.dll", "RegCreateKeyExA", 2);
+}
+H(adv_RegDeleteValueW) { return rt_call_a(c, a, 2, "advapi32.dll", "RegDeleteValueA", 2); }
+
+static void wname(uint32_t w, char *out, size_t cap) {
+    if (w) rt_get_wstr(w, out, cap);
+    else out[0] = 0;
+}
+
+/* Copy value v to the W caller's (type*, data, size*): strings become UTF-16. Under reg_mu. */
+static uint32_t put_value_w(RegValue *v, uint32_t ptype, uint32_t data, uint32_t psize) {
+    if (ptype) st32(ptype, v->type);
+    uint32_t need = is_string(v->type) ? 2 * utf8_to_w(v->data, v->len, 0) : v->len;
+    if (!psize) return data ? ERROR_INVALID_HANDLE : 0;
+    uint32_t cap = ld32(psize);
+    st32(psize, need);
+    if (!data) return 0;
+    if (cap < need) return ERROR_MORE_DATA;
+    if (is_string(v->type)) utf8_to_w(v->data, v->len, data);
+    else memcpy(G(data), v->data, v->len);
+    return 0;
+}
+
+/* RegQueryValueExW(key, name, reserved, &type, data, &size) */
+H(adv_RegQueryValueExW) {
+    UNUSED;
+    char name[256];
+    wname(a[1], name, sizeof name);
+    uint32_t r = ERROR_FILE_NOT_FOUND;
+    pthread_mutex_lock(&reg_mu);
+    reg_load();
+    const char *path = hkey_path(a[0]);
+    RegKey *k = path ? key_find(path) : NULL;
+    RegValue *v = k ? value_find(k, name) : NULL;
+    if (!path) r = ERROR_INVALID_HANDLE;
+    else if (v) r = put_value_w(v, a[3], a[4], a[5]);
+    if (g_opt.verbose || g_trace_imports)
+        rt_log("[reg] query %s \"%s\" -> %s\n", path ? path : "?", name, r == 0 ? "ok" : r == ERROR_MORE_DATA ? "buffer too small" : "not found");
+    pthread_mutex_unlock(&reg_mu);
+    return r;
+}
+
+/* RegSetValueExW(key, name, reserved, type, data, size) */
+H(adv_RegSetValueExW) {
+    UNUSED;
+    char name[256];
+    wname(a[1], name, sizeof name);
+    uint32_t r = ERROR_INVALID_HANDLE;
+    pthread_mutex_lock(&reg_mu);
+    reg_load();
+    const char *path = hkey_path(a[0]);
+    if (path) {
+        if (is_string(a[3]) && a[4]) {
+            uint32_t n = a[5] / 2;
+            if (a[3] == REG_SZ) { /* exactly one terminator */
+                uint32_t k = 0;
+                while (k < n && ld16(a[4] + 2 * k)) k++;
+                n = k + 1;
+            }
+            char *tmp = malloc(3 * n + 1);
+            uint32_t len = w_to_utf8(a[4], n, tmp, 3 * n + 1);
+            if (a[3] == REG_SZ) tmp[len - 1] = 0;
+            value_set(key_create(path), name, a[3], tmp, len);
+            free(tmp);
+        } else {
+            value_set(key_create(path), name, a[3], a[4] ? G(a[4]) : (const uint8_t *)"", a[4] ? a[5] : 0);
+        }
+        reg_save();
+        r = 0;
+    }
+    pthread_mutex_unlock(&reg_mu);
+    if (g_opt.verbose) rt_log("[reg] set %s \"%s\"\n", path ? path : "?", name);
+    return r;
+}
+
+/* RegEnumKeyExW(key, index, name, &nameLen, reserved, class, &classLen, &lastWrite) */
+H(adv_RegEnumKeyExW) {
+    uint32_t tmp = rt_heap_alloc(260 + 4, 1);
+    uint32_t args[8] = {a[0], a[1], tmp, tmp + 260, 0, 0, 0, 0};
+    st32(tmp + 260, 255);
+    uint32_t r = adv_RegEnumKeyExA(c, args);
+    if (r == 0) {
+        uint32_t n = (uint32_t)strlen((const char *)G(tmp));
+        if (n + 1 > ld32(a[3])) r = ERROR_MORE_DATA;
+        else {
+            rt_put_wstr(a[2], n + 1, (const char *)G(tmp));
+            st32(a[3], n);
+            if (a[6]) st32(a[6], 0);
+        }
+    }
+    rt_heap_free(tmp);
+    return r;
+}
+
+/* RegEnumValueW(key, index, name, &nameLen, reserved, &type, data, &dataLen) */
+H(adv_RegEnumValueW) {
+    UNUSED;
+    uint32_t r = ERROR_NO_MORE_ITEMS;
+    pthread_mutex_lock(&reg_mu);
+    reg_load();
+    const char *path = hkey_path(a[0]);
+    RegKey *k = path ? key_find(path) : NULL;
+    if (!path) r = ERROR_INVALID_HANDLE;
+    RegValue *v = k ? k->values : NULL;
+    for (uint32_t i = 0; v && i < a[1]; i++) v = v->next;
+    if (v) {
+        uint32_t n = (uint32_t)strlen(v->name);
+        if (n + 1 > ld32(a[3])) r = ERROR_MORE_DATA;
+        else {
+            rt_put_wstr(a[2], n + 1, v->name);
+            st32(a[3], n);
+            r = put_value_w(v, a[5], a[6], a[7]);
+        }
+    }
+    pthread_mutex_unlock(&reg_mu);
+    return r;
+}
+
+/* RegQueryInfoKeyW(key, class, &classLen, reserved, &subKeys, &maxSubKeyLen, &maxClassLen,
+ *                  &values, &maxValueNameLen, &maxValueLen, &securityDescriptor, &lastWrite) */
+H(adv_RegQueryInfoKeyW) {
+    UNUSED;
+    pthread_mutex_lock(&reg_mu);
+    reg_load();
+    const char *path = hkey_path(a[0]);
+    if (!path) {
+        pthread_mutex_unlock(&reg_mu);
+        return ERROR_INVALID_HANDLE;
+    }
+    RegKey *k = key_find(path);
+    uint32_t nsub = 0, maxsub = 0, nval = 0, maxname = 0, maxval = 0;
+    size_t n = strlen(path);
+    char seen[64][128];
+    for (RegKey *q = keys; q; q = q->next) {
+        if (strncasecmp(q->path, path, n) || q->path[n] != '\\') continue;
+        char child[128];
+        snprintf(child, sizeof child, "%.*s", (int)strcspn(q->path + n + 1, "\\"), q->path + n + 1);
+        uint32_t i;
+        for (i = 0; i < nsub && i < 64; i++)
+            if (!strcasecmp(seen[i], child)) break;
+        if (i < nsub) continue;
+        if (nsub < 64) snprintf(seen[nsub], 128, "%s", child);
+        nsub++;
+        if (strlen(child) > maxsub) maxsub = (uint32_t)strlen(child);
+    }
+    for (RegValue *v = k ? k->values : NULL; v; v = v->next) {
+        nval++;
+        if (strlen(v->name) > maxname) maxname = (uint32_t)strlen(v->name);
+        uint32_t len = is_string(v->type) ? 2 * v->len : v->len;
+        if (len > maxval) maxval = len;
+    }
+    pthread_mutex_unlock(&reg_mu);
+    if (a[2]) st32(a[2], 0);
+    if (a[1] && a[2]) st16(a[1], 0);
+    if (a[4]) st32(a[4], nsub);
+    if (a[5]) st32(a[5], maxsub);
+    if (a[6]) st32(a[6], 0);
+    if (a[7]) st32(a[7], nval);
+    if (a[8]) st32(a[8], maxname);
+    if (a[9]) st32(a[9], maxval);
+    if (a[10]) st32(a[10], 0);
+    if (a[11]) memset(G(a[11]), 0, 8);
+    return 0;
+}
+
 static const ImportDef defs[] = {
     {"advapi32.dll", "RegOpenKeyExA", adv_RegOpenKeyExA, 5, 0},
+    {"advapi32.dll", "RegOpenKeyExW", adv_RegOpenKeyExW, 5, 0},
+    {"advapi32.dll", "RegOpenKeyA", adv_RegOpenKeyA, 3, 0},
+    {"advapi32.dll", "RegOpenKeyW", adv_RegOpenKeyW, 3, 0},
+    {"advapi32.dll", "RegCreateKeyExW", adv_RegCreateKeyExW, 9, 0},
+    {"advapi32.dll", "RegCreateKeyA", adv_RegCreateKeyA, 3, 0},
+    {"advapi32.dll", "RegCreateKeyW", adv_RegCreateKeyW, 3, 0},
+    {"advapi32.dll", "RegDeleteValueW", adv_RegDeleteValueW, 2, 0},
+    {"advapi32.dll", "RegQueryValueExW", adv_RegQueryValueExW, 6, 0},
+    {"advapi32.dll", "RegSetValueExW", adv_RegSetValueExW, 6, 0},
+    {"advapi32.dll", "RegEnumKeyExW", adv_RegEnumKeyExW, 8, 0},
+    {"advapi32.dll", "RegEnumValueW", adv_RegEnumValueW, 8, 0},
+    {"advapi32.dll", "RegQueryInfoKeyW", adv_RegQueryInfoKeyW, 12, 0},
     {"advapi32.dll", "RegCreateKeyExA", adv_RegCreateKeyExA, 9, 0},
     {"advapi32.dll", "RegCloseKey", adv_RegCloseKey, 1, 0},
     {"advapi32.dll", "RegQueryValueExA", adv_RegQueryValueExA, 6, 0},
