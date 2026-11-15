@@ -36,9 +36,16 @@ def main():
     thi = tlo + text.Misc_VirtualSize
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
 
-    def plausible(va):
+    # Pointers from a table embedded in .text are MSVC C++ exception-handling
+    # FuncInfo/handler tables; the catch/cleanup funclets they point at start with
+    # a normal prologue or a bare `ret`/`ret n` (an empty handler). Accepting only
+    # these avoids lifting the many coincidental pointer-like words in .text.
+    EH_EXTRA = {0xC3, 0xC2}
+
+    def plausible(va, from_text):
         off = va - base
-        if img[off] not in PROLOGUES:
+        ok = PROLOGUES | EH_EXTRA if from_text else PROLOGUES
+        if img[off] not in ok:
             return False
         try:
             next(md.disasm(img[off:off + 8], va))
@@ -46,16 +53,20 @@ def main():
         except StopIteration:
             return False
 
-    found = set()
+    found = {}  # target -> strict (True if from a data section, False if only from .text)
     for s in pe.sections:
-        if s.Name.rstrip(b"\0").decode(errors="replace") not in (".data", ".rdata"):
+        name = s.Name.rstrip(b"\0").decode(errors="replace")
+        if name not in (".data", ".rdata", ".text"):
             continue
+        strict = name != ".text"
         raw = img[s.VirtualAddress:s.VirtualAddress + s.Misc_VirtualSize]
         for off in range(0, len(raw) - 4, 4):
             v = struct.unpack_from("<I", raw, off)[0]
             if tlo <= v < thi and v not in have:
-                found.add(v)
-    for v in sorted(x for x in found if plausible(x)):
+                # a data-section hit is authoritative; keep the strict flag unless
+                # a data section also points here
+                found[v] = found.get(v, True) and strict
+    for v in sorted(k for k, strict in found.items() if plausible(k, not strict)):
         print("0x%08x,0,ptr_%08x,0,0" % (v, v))
 
 
