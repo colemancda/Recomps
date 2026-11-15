@@ -301,3 +301,30 @@ GameGuard KeyCrypt -> renders the login screen.
   exchange. Remaining `VariantChangeType 13 -> 19` (VT_UNKNOWN -> VT_UI4) warnings
   are non-fatal but worth filling in if a later screen needs them.
 - Then character selection / world entry, sound, and the aarch64 / handheld build.
+
+## Login buttons: loaded but not drawn (lifted CLogin UI logic)
+
+The login screen renders the signboard, the Login ID / Password fields, the Log in
+button and (after the GDI TextOut fix) the "Ver. 0.62" label, but the lower
+signboard buttons are missing: Register (BtNew), Homepage, Quit, Guest Login,
+Save login ID, Find login ID (BtLoginIDLost), Find P/W (BtPasswdLost).
+
+Traced end to end:
+- A WZ reader (tools, GMS IV 4D 23 C7 2B) confirms every button exists in
+  UI.wz/Login.img/Title with real bitmap data (datalen ~1-2 KB), normal
+  dimensions and format 1 (A4R4G4B4) — the same kind as BtLogin, which renders.
+  No `_inlink`/`_outlink`, so it is not a shared-bitmap resolution problem.
+- RECOMP_TRACE_TEX shows the client creates all the button textures (the 128x64 /
+  128x32 A4R4G4B4 textures).
+- Instrumenting IDirect3DDevice8::DrawPrimitiveUP (the only draw path; no indexed
+  draws) and transforming each vertex through World*View*Proj + viewport shows
+  only TWO buttons are ever submitted as draws — BtLogin at screen (634,232) and
+  one more at (664,222), both correctly placed in the top-right of the signboard.
+  The other buttons' textures are loaded but never drawn.
+
+So this is not resources, position, transform or clipping: the recompiled login
+code only issues draws for a couple of the login buttons. The cause is in the
+lifted CLogin / UIWindow child-draw (visibility) logic and needs deeper
+recompiled-code debugging. The retail client under Wine (same handshake-only mock,
+GameGuard bypassed with a stub npkcrypt.dll) draws them all, confirming the data
+and the server interaction are sufficient — the gap is ours.
