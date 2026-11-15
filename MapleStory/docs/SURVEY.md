@@ -213,3 +213,55 @@ Debug instrumentation added for this (all cost-free unless enabled):
   - `RECOMP_TRACE_EXIT=1` -> guest backtrace at `ExitProcess` and `PostQuitMessage`.
   - `--trace-imports` now decodes each MSVC C++ throw's catchable type names, and
     prints the HRESULT for a thrown `_com_error` (`runtime/seh.c`).
+
+## The client renders: Nexon + Wizet splash screens (login pipeline working)
+
+Four fixes took the client from the Base.wz STG_E_FILENOTFOUND failure all the
+way to rendering real game graphics:
+
+1. **File-backed memory mapping** (`runtime/file.c`, `runtime/mem.c`). The Wz
+   resource engine (NameSpace.dll) memory-maps Base.wz and every other `.wz` and
+   parses them in place. The old mapping stub returned a zeroed heap buffer, so
+   the engine read zeroes and every resource lookup failed. Now a real file
+   mapping: `CreateFileMappingA`/`MapViewOfFile` map the file's bytes, demand-paged
+   via `rt_map_file` (mmap MAP_FIXED into a 2 GiB arena at guest 0x80000000) so
+   the 1+ GiB of `.wz` data costs no heap. With this the client mounts all 17
+   `.wz` files, exactly like the retail client under Wine.
+
+2. **Lifted ZLZ.dll** (the Wz canvas zlib decompressor). Canvas.dll calls
+   `ZLZCreateInflator` to inflate each image out of the Wz data; it was an
+   unimplemented dynamic import. Lifted like the other engine DLLs (own base
+   0x10000000) and registered so LoadLibraryA finds it.
+
+3. **oleaut32 `CreateErrorInfo` (ord 202) and `VariantCopyInd` (ord 11)**. The
+   engine's COM error paths need CreateErrorInfo; property handling needs
+   VariantCopyInd (VT_BYREF dereference).
+
+4. **wininet updater stubs**. The auto-updater's FTP calls report the patch
+   server unreachable, so it skips the update and proceeds (as the retail client
+   does when the server is down).
+
+Result: `exit 0`, no crashes, **784 frames presented** through the full
+D3D8-on-GLES 2D pipeline (BeginScene/Clear/DrawPrimitiveUP/EndScene/Present).
+The **Nexon** and **Wizet** splash logos render pixel-correct (decompressed from
+the `.wz` via the lifted ijl15 JPEG and ZLZ zlib decoders).
+
+### Next blocker: GameGuard KeyCrypt init (after the splash, before the title)
+
+After the two splash logos, while transitioning to the title/login screen, the
+client throws a C++ `CSecurityKeyCryptInitFailed` exception, caught by the
+top-level handler which shuts down cleanly. It is thrown from `FUN_00867060`
+immediately after `npkcrypt.dll!NPKGetAppCompatFlag` / `NPKSetAppCompatFlag`
+(both stubbed to return 0 in `runtime/maple.c`): GameGuard's KeyCrypt (nProtect
+packet-crypto) initialisation check fails. v62 GMS encrypts packets with its own
+Maple AES/Shanda cipher, not GameGuard KeyCrypt, so the fix is to make the
+npkcrypt init path report success the way `FUN_00867060` expects (needs reading
+that function's check), rather than to implement real KeyCrypt. This is the next
+step toward the interactive login screen.
+
+Debugging aids used: `--trace-imports` now prints each MSVC C++ throw's type name
+and (for `_com_error`) HRESULT; `RECOMP_TRACE_EXIT=1` dumps a guest backtrace at
+`ExitProcess`/`PostQuitMessage`. Run the client windowed with
+`DISPLAY=:99 ./build/host/maple --exe orig/GMSv62.exe --gamedir orig
+--savedir <dir> --frames N --dump-every K --dump-path f_%d.png` against a mock
+server that sends the v62 handshake (Xvfb for the window + message pump).
