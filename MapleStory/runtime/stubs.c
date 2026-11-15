@@ -225,6 +225,30 @@ H(imm_ImmGetIMEFileNameA) {
     return 0;
 }
 
+/* --------------------------------------------------------- advapi32 crypto
+ * CryptoAPI. The client acquires a provider at start-up and uses hashing and
+ * RC2/RSA for login. At boot only CryptAcquireContext is reached; the rest are
+ * stubbed to succeed with opaque handles so the client proceeds. Real hashing
+ * and ciphers are needed before network login works (TODO). */
+H(adv_CryptAcquireContext) {
+    UNUSED; /* (prov*, container, provider, type, flags) */
+    if (a[0]) st32(a[0], 0xC0DE0010u);
+    return 1;
+}
+H(adv_CryptCreateHash) {
+    UNUSED; /* (prov, algid, key, flags, hash*) */
+    if (a[4]) st32(a[4], 0xC0DE0011u);
+    return 1;
+}
+H(adv_CryptGetHashParam) {
+    UNUSED; /* (hash, param, data, len*, flags): zero-filled until real hashing */
+    uint32_t want = a[3] ? ld32(a[3]) : 0;
+    if (a[1] == 4 && a[2]) st32(a[2], 16);             /* HP_HASHSIZE */
+    else if (a[2] && want) memset(G(a[2]), 0, want);  /* HP_HASHVAL */
+    return 1;
+}
+H(adv_crypt_ok) { UNUSED; return 1; }
+
 /* ------------------------------------------------------ advapi32 security */
 /* The game sets security on the files it creates; access checks always grant. */
 H(adv_AllocateAndInitializeSid) {
@@ -246,6 +270,21 @@ H(adv_OpenThreadToken) {
     UNUSED;
     rt_set_last_error(c, 1008); /* ERROR_NO_TOKEN: the thread is not impersonating */
     return 0;
+}
+/* Privileges. The client enables a privilege (GameGuard/shutdown pattern) with
+ * LookupPrivilegeValue + AdjustTokenPrivileges; both succeed with a dummy LUID. */
+H(adv_LookupPrivilegeValue) {
+    UNUSED; /* (system, name, LUID*) */
+    if (a[2]) {
+        st32(a[2], 0x1000);
+        st32(a[2] + 4, 0);
+    }
+    return 1;
+}
+H(adv_AdjustTokenPrivileges) {
+    UNUSED; /* (token, disableAll, new, buflen, prev*, retlen*) */
+    if (a[5]) st32(a[5], 0);
+    return 1;
 }
 /* AccessCheck(sd, token, desired, mapping, privileges, privlen, granted*, status*) */
 H(adv_AccessCheck) {
@@ -377,6 +416,13 @@ H(oa_VariantInit) {
     memset(G(a[0]), 0, 16);
     return 0;
 }
+/* COM error object (IErrorInfo). No error is ever current. */
+H(oa_GetErrorInfo) {
+    UNUSED; /* (reserved, IErrorInfo**) */
+    if (a[1]) st32(a[1], 0);
+    return 1; /* S_FALSE: no error object */
+}
+H(oa_SetErrorInfo) { UNUSED; return 0; /* S_OK */ }
 /* IUnknown::AddRef / Release of a guest object */
 static void com_call(CPU *c, uint32_t obj, int slot) {
     uint32_t r, args[1] = {obj};
@@ -515,10 +561,26 @@ static const ImportDef defs[] = {
     {"imm32.dll", "ImmUnlockIMC", st_one, 1, 0},
     {"imm32.dll", "ImmLockIMCC", st_zero, 1, 0},
     {"imm32.dll", "ImmUnlockIMCC", st_one, 1, 0},
+    {"advapi32.dll", "CryptAcquireContextA", adv_CryptAcquireContext, 5, 0},
+    {"advapi32.dll", "CryptAcquireContextW", adv_CryptAcquireContext, 5, 0},
+    {"advapi32.dll", "CryptReleaseContext", adv_crypt_ok, 2, 0},
+    {"advapi32.dll", "CryptCreateHash", adv_CryptCreateHash, 5, 0},
+    {"advapi32.dll", "CryptHashData", adv_crypt_ok, 4, 0},
+    {"advapi32.dll", "CryptGetHashParam", adv_CryptGetHashParam, 5, 0},
+    {"advapi32.dll", "CryptDestroyHash", adv_crypt_ok, 1, 0},
+    {"advapi32.dll", "CryptDeriveKey", adv_crypt_ok, 5, 0},
+    {"advapi32.dll", "CryptImportKey", adv_crypt_ok, 6, 0},
+    {"advapi32.dll", "CryptDestroyKey", adv_crypt_ok, 1, 0},
+    {"advapi32.dll", "CryptEncrypt", adv_crypt_ok, 7, 0},
+    {"advapi32.dll", "CryptDecrypt", adv_crypt_ok, 6, 0},
+    {"advapi32.dll", "CryptVerifySignatureA", adv_crypt_ok, 6, 0},
     {"advapi32.dll", "AllocateAndInitializeSid", adv_AllocateAndInitializeSid, 11, 0},
     {"advapi32.dll", "FreeSid", adv_FreeSid, 1, 0},
     {"advapi32.dll", "OpenProcessToken", adv_OpenProcessToken, 3, 0},
     {"advapi32.dll", "OpenThreadToken", adv_OpenThreadToken, 4, 0},
+    {"advapi32.dll", "LookupPrivilegeValueA", adv_LookupPrivilegeValue, 3, 0},
+    {"advapi32.dll", "LookupPrivilegeValueW", adv_LookupPrivilegeValue, 3, 0},
+    {"advapi32.dll", "AdjustTokenPrivileges", adv_AdjustTokenPrivileges, 6, 0},
     {"advapi32.dll", "ImpersonateSelf", st_one, 1, 0},
     {"advapi32.dll", "RevertToSelf", st_one, 0, 0},
     {"advapi32.dll", "AccessCheck", adv_AccessCheck, 8, 0},
@@ -537,6 +599,8 @@ static const ImportDef defs[] = {
     {"ole32.dll", "StringFromGUID2", ole_StringFromGUID2, 3, 0},
     {"oleaut32.dll", "#2", oa_SysAllocString, 1, 0},
     {"oleaut32.dll", "SysAllocString", oa_SysAllocString, 1, 0},
+    {"oleaut32.dll", "GetErrorInfo", oa_GetErrorInfo, 2, 0},
+    {"oleaut32.dll", "SetErrorInfo", oa_SetErrorInfo, 2, 0},
     {"oleaut32.dll", "#3", oa_SysReAllocString, 2, 0},
     {"oleaut32.dll", "#4", oa_SysAllocStringLen, 2, 0},
     {"oleaut32.dll", "SysAllocStringLen", oa_SysAllocStringLen, 2, 0},
