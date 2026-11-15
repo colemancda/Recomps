@@ -34,6 +34,8 @@ void rt_com_free(uint32_t obj);
 
 /* "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" for a GUID in guest memory. */
 const char *rt_guid_str(uint32_t guid, char buf[40]);
+/* The same in a per-thread buffer, for log messages. */
+const char *rt_guid_text(uint32_t guid);
 int rt_guid_eq(uint32_t guid, const uint8_t ref[16]);
 
 /* Scratch space below the guest stack pointer for structures passed to guest
