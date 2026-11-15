@@ -86,6 +86,7 @@ static const ImportTable *const import_tables[] = {
     &rt_imports_ddraw,
     &rt_imports_dinput,
     &rt_imports_dsound,
+    &rt_imports_extra,
 };
 
 /* Winsock is imported by ordinal; these are ws2_32's (and wsock32's) fixed numbers. */
