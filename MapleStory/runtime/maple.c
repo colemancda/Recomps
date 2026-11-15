@@ -4,9 +4,13 @@
 
 #include "rt.h"
 
-/* No lifted-code hooks yet. MapleStory's unpacked client (GMSv62.exe) statically
- * links its CRT and has no MSLU layer, so nothing like Age of Mythology's
- * _GetProcAddressInternal hook is needed. */
+/* No lifted-code hooks active yet. The client's start-up reaches GameGuard's
+ * anti-hack layer: a static constructor at 0x672c93 enumerates files
+ * (FindFirstFileA "*") and compares them, with lstrcmpiA, against a decrypted
+ * cheat-tool blocklist, showing "close the hacking program and restart" on a
+ * match; past it, GameGuard resolves Win32 APIs indirectly into a table around
+ * 0x97b384 and calls through it. Defeating this obfuscated layer is a separate
+ * effort (see docs/SURVEY.md); until then the client stops here. */
 const RtHook rt_hooks[] = {{0}};
 const unsigned rt_nhooks = 0;
 
