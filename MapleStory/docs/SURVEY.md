@@ -141,3 +141,30 @@ cipher. Pairing the recompiled client with it (client → `MapleStoryServer62` o
 127.0.0.1:8484) is the next milestone. The client also resolves `WSASend`/
 `WSARecv` (overlapped I/O) which are not yet provided; those are the remaining
 Winsock pieces for the receive path.
+
+## The login handshake works (step 2 → step 6)
+
+With `WSASend`/`WSARecv` added (`runtime/winsock.c`), the recompiled client was
+driven against a minimal mock server that sends the v62 handshake — the exact
+bytes from the Swift repo's test vector (`Tests/MapleStory62Tests/LoginTests`):
+
+    0D 00 3E 00 00 00  46 72 7A 18  52 30 78 14  08
+    opcode/len 0x0D | version 62 | value0 0 | recvIV | sendIV | region 8 (global)
+
+On receiving it, the client **stops retrying, sets up its receive cipher from the
+IVs, and initialises Direct3D 8** (the GL backend reports "drawing with … OpenGL
+ES 3.2, 800x600") and DirectInput — i.e. it accepts the handshake and begins the
+login scene. This validates the recompiled client's network receive path and the
+v62 protocol end to end.
+
+The client then exits before presenting the login screen. It uses
+`WSAAsyncSelect` (message-based async sockets): it expects a window message when
+the socket connects / has data, and drives its login state machine from that.
+Headless (no real window with a running message pump) the notification does not
+advance the state machine, so after reading the handshake it stalls and exits.
+The next steps: run under a real window (Xvfb) so the message loop delivers the
+socket notifications, confirm the login UI loads from `UI.wz` (ijl15, now lifted,
+decodes the JPEGs — its boot-time stubs were removed), and then pair with
+`colemancda/maplestory`'s `MapleStoryServer62` for the full login. (The Swift
+server has its own Linux-portability issues — `XMLParser`/`FoundationXML` and a
+socket `featureUnsupported` error — separate from the recompilation.)
