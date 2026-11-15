@@ -1,0 +1,4 @@
+# Installed game files (not redistributable) and anything derived from them
+orig/
+build/
+__pycache__/
