@@ -4,13 +4,10 @@
 
 #include "rt.h"
 
-/* No lifted-code hooks active yet. The client's start-up reaches GameGuard's
- * anti-hack layer: a static constructor at 0x672c93 enumerates files
- * (FindFirstFileA "*") and compares them, with lstrcmpiA, against a decrypted
- * cheat-tool blocklist, showing "close the hacking program and restart" on a
- * match; past it, GameGuard resolves Win32 APIs indirectly into a table around
- * 0x97b384 and calls through it. Defeating this obfuscated layer is a separate
- * effort (see docs/SURVEY.md); until then the client stops here. */
+/* No lifted-code hooks needed. GameGuard's anti-hack scanner (0x672c93) is a
+ * DLL-planting check (system DLLs must not be files in the game folder); lifted
+ * system DLLs live in a syslib/ subfolder the scan does not see (loader.c,
+ * build.sh). See docs/SURVEY.md. */
 const RtHook rt_hooks[] = {{0}};
 const unsigned rt_nhooks = 0;
 
