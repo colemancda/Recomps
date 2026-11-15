@@ -566,6 +566,7 @@ H(dev_CreateTexture) {
     UNUSED;
     uint32_t w = a[1], h = a[2], levels = a[3];
     if (!w || !h || !format_ok(a[5])) return D3DERR_INVALIDCALL;
+    if (getenv("RECOMP_TRACE_TEX")) rt_log("[tex] %ux%u fmt=%u\n", w, h, a[5]);
     uint32_t full = 1;
     for (uint32_t x = w > h ? w : h; x > 1; x >>= 1) full++;
     if (!levels || levels > full) levels = full;
