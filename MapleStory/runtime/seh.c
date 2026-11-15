@@ -10,6 +10,7 @@
  * Hardware exceptions (access violation, divide error, breakpoint) are not
  * turned into guest exceptions: they stop the program with a diagnostic.
  */
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -64,14 +65,23 @@ static void describe_cxx(uint32_t rec) {
     uint32_t types = ld32(throw_info + 12);
     if (!rt_guest_readable(types, 8)) return;
     uint32_t n = ld32(types);
-    fprintf(stderr, "  C++ exception object at %08x, catchable types:", ld32(rec + 0x14 + 4));
+    uint32_t exobj = ld32(rec + 0x14 + 4);
+    fprintf(stderr, "  C++ exception object at %08x, catchable types:", exobj);
+    int is_com_error = 0;
     for (uint32_t i = 0; i < n && i < 8; i++) {
         uint32_t ct = ld32(types + 4 + 4 * i);
         if (!rt_guest_readable(ct, 8)) break;
         uint32_t ti = ld32(ct + 4);
         if (!rt_guest_readable(ti, 16)) break;
-        fprintf(stderr, " %s", (const char *)G(ti + 8));
+        const char *name = (const char *)G(ti + 8);
+        fprintf(stderr, " %s", name);
+        if (strstr(name, "_com_error")) is_com_error = 1;
     }
+    /* _com_error stores its HRESULT at object+4 (after the vtable pointer); it is
+     * the failed result of the COM call that the #import wrapper turned into a
+     * throw, so naming it points straight at the method that returned it. */
+    if (is_com_error && rt_guest_readable(exobj, 8))
+        fprintf(stderr, " (hr=%08x)", ld32(exobj + 4));
     fprintf(stderr, "\n");
 }
 
@@ -91,6 +101,7 @@ H(k32_RaiseException) {
     for (uint32_t i = 0; i < n; i++) st32(rec + 0x14 + 4 * i, ld32(a[3] + 4 * i));
     fill_context(c, ctx, ra, sp + 20);
     if (g_trace_imports) rt_log("[seh %x] RaiseException code %08x from %08x\n", c->thread_id, a[0], ra);
+    if (g_trace_imports && a[0] == CXX_EXCEPTION) describe_cxx(rec);
 
     ESP = base - 16;
     uint32_t frame = ld32(c->fs_base);
