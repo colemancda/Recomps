@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Find code-pointer targets in a PE's data sections that a function list misses.
+
+  tools/data_code_pointers.py GMSv62.exe build/survey/GMSv62.functions.csv > extra.csv
+
+MapleStory's client (MSVC, C++) keeps large tables of function pointers in
+.data and .rdata: the CRT static-initialiser array and the engine's vtables.
+Entries in these are only ever called indirectly, so a plain disassembly (and
+even Ghidra's analysis) leaves some unrecovered, and the lifter then has no entry
+for them. This scans the data sections for aligned 32-bit words that point into
+.text and begin with a plausible function prologue, and emits those not already
+in the function list as extra entries (addr,size,name,is_thunk,xrefs), the same
+format the lifter reads. Adding real entry points is always safe: at worst the
+lifter emits a few functions that are never reached.
+"""
+import struct
+import sys
+
+import capstone
+import pefile
+
+PROLOGUES = {0x55, 0x53, 0x56, 0x57, 0x8B, 0x83, 0x81, 0x6A, 0x68, 0xE9, 0xE8, 0xB8, 0xFF, 0x33, 0xA1, 0x64}
+
+
+def main():
+    pe = pefile.PE(sys.argv[1])
+    have = set()
+    if len(sys.argv) > 2:
+        for line in open(sys.argv[2]):
+            if line.startswith("0x"):
+                have.add(int(line.split(",")[0], 16))
+    base = pe.OPTIONAL_HEADER.ImageBase
+    img = pe.get_memory_mapped_image()
+    text = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".text")
+    tlo = text.VirtualAddress + base
+    thi = tlo + text.Misc_VirtualSize
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+
+    def plausible(va):
+        off = va - base
+        if img[off] not in PROLOGUES:
+            return False
+        try:
+            next(md.disasm(img[off:off + 8], va))
+            return True
+        except StopIteration:
+            return False
+
+    found = set()
+    for s in pe.sections:
+        if s.Name.rstrip(b"\0").decode(errors="replace") not in (".data", ".rdata"):
+            continue
+        raw = img[s.VirtualAddress:s.VirtualAddress + s.Misc_VirtualSize]
+        for off in range(0, len(raw) - 4, 4):
+            v = struct.unpack_from("<I", raw, off)[0]
+            if tlo <= v < thi and v not in have:
+                found.add(v)
+    for v in sorted(x for x in found if plausible(x)):
+        print("0x%08x,0,ptr_%08x,0,0" % (v, v))
+
+
+if __name__ == "__main__":
+    main()
