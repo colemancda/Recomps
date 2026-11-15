@@ -68,10 +68,13 @@ for mode in liveness noliveness; do
         exit 1
     fi
     rt_srcs="$(ls "$recomp"/runtime/*.c | grep -v '/main\.c$')"
+    # gdi.c renders fonts with FreeType
+    if [ -n "$sysroot" ]; then ft="-I$sysroot/usr/include/freetype2 -lfreetype"
+    else ft="$(pkg-config --cflags --libs freetype2)"; fi
     # shellcheck disable=SC2086
     "$cc" -std=gnu11 -O1 -fno-strict-aliasing -fwrapv -foptimize-sibling-calls -w ${EXTRA_CFLAGS:-} \
         -I"$recomp/runtime" -I"$gen" -I"$here" \
-        -DRT_NO_SDL "$gen"/chunk_*.c "$gen/tables.c" $rt_srcs "$here/lifted_main.c" -lm -pthread \
+        -DRT_NO_SDL "$gen"/chunk_*.c "$gen/tables.c" $rt_srcs "$here/lifted_main.c" -lm -pthread $ft \
         -o "$out/lifted_$mode"
     run=("$out/lifted_$mode")
     [ -n "$sysroot" ] && run=(qemu-aarch64 -L "$sysroot" "$out/lifted_$mode")
