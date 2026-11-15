@@ -48,6 +48,33 @@ void rt_mem_init(void) {
     memset(G(GUEST_IMP_BASE), 0xC3, GUEST_IMP_SIZE);
 }
 
+/* Memory-mapped files (the Wz resource engine maps every .wz — well over 1 GiB
+ * in total — and reads them in place). A bump arena high in the guest space, laid
+ * over the guest reservation with MAP_FIXED so the pages come straight from the
+ * file on demand; nothing is copied into the heap. Views are never unmapped (the
+ * game keeps each .wz for its lifetime), so no free list is needed. */
+static uint32_t map_brk = GUEST_MAP_BASE;
+static pthread_mutex_t map_mu = PTHREAD_MUTEX_INITIALIZER;
+
+uint32_t rt_map_file(int fd, uint32_t size, int writable) {
+    if (!size) return 0;
+    uint32_t asize = (size + 0xFFFu) & ~0xFFFu;
+    pthread_mutex_lock(&map_mu);
+    if ((uint64_t)map_brk + asize > GUEST_MAP_END) {
+        pthread_mutex_unlock(&map_mu);
+        return 0;
+    }
+    uint32_t va = map_brk;
+    map_brk += asize;
+    pthread_mutex_unlock(&map_mu);
+    int prot = PROT_READ | (writable ? PROT_WRITE : 0);
+    /* MAP_PRIVATE: any write (PAGE_WRITECOPY views) is a private copy; the .wz
+     * files are never modified on disk. */
+    void *p = mmap(G(va), size, prot, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (p == MAP_FAILED) return 0;
+    return va;
+}
+
 void rt_mem_commit(uint32_t addr, uint32_t size) {
     uint32_t lo = addr & ~0xFFFu;
     uint64_t hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;

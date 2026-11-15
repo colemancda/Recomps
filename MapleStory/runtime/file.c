@@ -793,8 +793,46 @@ H(k32_GetFileTime) {
     return 1;
 }
 
+/* ------------------------------------------------------------- file mapping
+ * Two uses in the game:
+ *   - Mapping a real file to read it. The Wz resource engine (NameSpace.dll)
+ *     maps Base.wz and the other .wz files and parses them straight out of the
+ *     view, so the view must hold the file's actual bytes, not zeroes.
+ *   - Anonymous shared memory (hFile == INVALID_HANDLE_VALUE/0): single-instance
+ *     detection and small shared buffers; a zeroed block of the requested size.
+ * There is one process, so the mapping object and the view are both just the
+ * guest buffer address (no cross-process name tracking); MapViewOfFile adds the
+ * requested offset. Views of a file are read-only copies: no write-back, which
+ * the game never relies on (it maps .wz PAGE_READONLY). */
+H(k32_CreateFileMappingA) {
+    UNUSED; /* (hFile, sa, protect, sizeHigh, sizeLow, name) */
+    RtFile *f = rt_handle_get(a[0], RT_H_FILE);
+    if (f) {
+        struct stat st;
+        if (fstat(f->fd, &st) != 0) {
+            rt_set_last_error(c, ERROR_INVALID_HANDLE);
+            return 0;
+        }
+        uint32_t size = a[4]; /* sizeLow; 0 means the whole file */
+        if (size == 0 || size > (uint32_t)st.st_size) size = (uint32_t)st.st_size;
+        int writable = a[2] != 0x2; /* anything but PAGE_READONLY: allow COW writes */
+        uint32_t va = rt_map_file(f->fd, size, writable);
+        if (!va) rt_set_last_error(c, 8 /* ERROR_NOT_ENOUGH_MEMORY */);
+        return va;
+    }
+    uint32_t size = a[4] ? a[4] : 0x1000;
+    uint32_t mem = rt_heap_alloc(size, 1);
+    return mem ? mem : 0;
+}
+H(k32_MapViewOfFile) {
+    UNUSED; /* (hMapping, access, offHigh, offLow, bytes): the handle is the memory */
+    return a[0] + a[3];
+}
+
 static const ImportDef defs[] = {
     {"kernel32.dll", "CreateFileA", k32_CreateFileA, 7, 0},
+    {"kernel32.dll", "CreateFileMappingA", k32_CreateFileMappingA, 6, 0},
+    {"kernel32.dll", "MapViewOfFile", k32_MapViewOfFile, 5, 0},
     {"kernel32.dll", "ReadFile", k32_ReadFile, 5, 0},
     {"kernel32.dll", "WriteFile", k32_WriteFile, 5, 0},
     {"kernel32.dll", "SetFilePointer", k32_SetFilePointer, 4, 0},

@@ -56,6 +56,8 @@ extern const unsigned rt_nimages;
 #define GUEST_EXIT_ADDR 0x7FFF0000u /* return address of the entry point */
 #define GUEST_CB_RET    0x7FFF0010u /* return address of a host-to-guest call */
 #define GUEST_THREAD_RET 0x7FFF0020u /* return address of a thread start routine */
+#define GUEST_MAP_BASE  0x80000000u    /* memory-mapped files (.wz), demand-paged */
+#define GUEST_MAP_END   0x100000000ull /* up to the top of the 4 GiB guest space */
 
 #define TEB_LAST_ERROR  0x34u
 #define TEB_TLS_SLOTS   0xE10u
@@ -65,6 +67,10 @@ extern const unsigned rt_nimages;
 /* ---- memory (mem.c); the allocators are thread safe ---- */
 void rt_mem_init(void);
 void rt_mem_commit(uint32_t addr, uint32_t size); /* make [addr, addr+size) read/write */
+/* Map the first `size` bytes of the open file `fd` into the guest's file-mapping
+ * arena, demand-paged, and return the guest address (0 on failure). `writable`
+ * makes the view copy-on-write (changes stay private, never reach the file). */
+uint32_t rt_map_file(int fd, uint32_t size, int writable);
 uint32_t rt_sys_alloc(uint32_t size);              /* bump allocation in the system area */
 uint32_t rt_sys_strdup(const char *s);
 

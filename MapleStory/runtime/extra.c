@@ -58,23 +58,13 @@ H(ex_CallNextHookEx) { UNUSED; return 0; }
 H(ex_MsgWaitForMultipleObjects) { UNUSED; return 0x102; } /* WAIT_TIMEOUT */
 
 /* ------------------------------------------------------------------ kernel32: file mapping */
-/* Shared memory. The client uses a named mapping for single-instance detection
- * and small shared buffers. Backed by guest heap; names are not tracked across
- * processes (there is only one process), so OpenFileMapping reports absent. */
-H(ex_CreateFileMappingA) {
-    UNUSED; /* (hFile, sa, protect, sizeHigh, sizeLow, name) */
-    uint32_t size = a[4] ? a[4] : 0x1000;
-    uint32_t mem = rt_heap_alloc(size, 1);
-    return mem ? mem : 0;
-}
+/* CreateFileMappingA/MapViewOfFile live in file.c (they need the file layer to
+ * back a view with the mapped file's bytes). OpenFileMapping reports absent
+ * (there is one process, so no named mapping from another one exists). */
 H(ex_OpenFileMappingA) {
     UNUSED;
     rt_set_last_error(c, 2); /* ERROR_FILE_NOT_FOUND: no existing mapping */
     return 0;
-}
-H(ex_MapViewOfFile) {
-    UNUSED; /* (hMapping, access, offHigh, offLow, bytes): the handle is the memory */
-    return a[0] + a[3];
 }
 H(ex_UnmapViewOfFile) { UNUSED; return 1; }
 H(ex_FlushViewOfFile) { UNUSED; return 1; }
@@ -137,9 +127,7 @@ static const ImportDef defs[] = {
     {"user32.dll", "CallNextHookEx", ex_CallNextHookEx, 4, 0},
     {"user32.dll", "MsgWaitForMultipleObjects", ex_MsgWaitForMultipleObjects, 5, 0},
 
-    {"kernel32.dll", "CreateFileMappingA", ex_CreateFileMappingA, 6, 0},
     {"kernel32.dll", "OpenFileMappingA", ex_OpenFileMappingA, 3, 0},
-    {"kernel32.dll", "MapViewOfFile", ex_MapViewOfFile, 5, 0},
     {"kernel32.dll", "UnmapViewOfFile", ex_UnmapViewOfFile, 1, 0},
     {"kernel32.dll", "FlushViewOfFile", ex_FlushViewOfFile, 2, 0},
     {"kernel32.dll", "OpenProcess", ex_OpenProcess, 3, 0},
