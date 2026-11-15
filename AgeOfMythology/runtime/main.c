@@ -36,10 +36,12 @@ static void usage(const char *argv0) {
             "                      text STRING, fullscr, quit. A frame written +N counts from the previous step.\n"
             "  --input-file FILE   the same, one step per line; # starts a comment line\n"
             "  --no-sound          tell the game there is no sound device\n"
+            "  --font-dir DIR      directory with the Liberation TrueType fonts that stand in for\n"
+            "                      Arial, Times New Roman and Courier New\n"
+            "                      (default /usr/share/fonts/truetype/liberation)\n"
             "  --dump-audio FILE   write the mixed sound to a WAV file (44.1 kHz stereo) instead of\n"
             "                      playing it; works headless\n"
-            "  --broker HOST[:PORT] the server the game asks for its world list (default port 8372);\n"
-            "                      stored in the registry file as IP, BuddyIP and Port\n"
+
             "  --local-address IP  the local IPv4 address: sockets are bound to it and the game is told\n"
             "                      it is this machine's address. With 127.0.0.2, 127.0.0.3, ... (not\n"
             "                      127.0.0.1) several instances can run on one machine.\n"
@@ -181,8 +183,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(o, "--dump-window")) g_opt.dump_window = 1;
         else if (!strcmp(o, "--virtual-clock")) g_opt.virtual_clock = 1;
         else if (!strcmp(o, "--no-sound")) g_opt.no_sound = 1;
+        else if (!strcmp(o, "--font-dir") && has) rt_gdi_set_font_dir(argv[++i]);
         else if (!strcmp(o, "--dump-audio") && has) snprintf(g_opt.dump_audio, sizeof g_opt.dump_audio, "%s", argv[++i]);
-        else if (!strcmp(o, "--broker") && has) snprintf(g_opt.broker, sizeof g_opt.broker, "%s", argv[++i]);
         else if (!strcmp(o, "--trace-net")) g_opt.trace_net = 1;
         else if (!strcmp(o, "--login") && i + 2 < argc) {
             login_user = argv[++i];
@@ -274,7 +276,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "recomp: %u lifted functions in %u images; %s mapped at 0x%08x, entry 0x%08x\n", nf,
                 rt_nimages, exe, g_image.base, g_image.entry);
         for (unsigned i = 0; i < g_ndlls; i++)
-            fprintf(stderr, "recomp:   %s at 0x%08x\n", g_dlls[i].desc->name, g_dlls[i].base);
+            fprintf(stderr, "recomp:   %s at 0x%08x\n", g_dlls[i].name, g_dlls[i].base);
     }
     /* The statically imported DLLs initialise first, as on Windows. */
     if (!rt_dll_attach(c)) rt_fatal(c, 4, "a DLL failed to initialise");
