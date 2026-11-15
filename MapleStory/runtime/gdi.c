@@ -41,7 +41,7 @@ typedef struct GdiObj {
         } dc;
         Font font;
         struct { /* bitmap */
-            int w, h, bpp;
+            int w, h, bpp, topdown;
             uint32_t bits; /* guest memory, or 0 */
         } bmp;
     } u;
@@ -307,6 +307,108 @@ static uint32_t glyph_outline(CPU *c, const uint32_t *a) {
 }
 H(gdi_GetGlyphOutline) { return glyph_outline(c, a); }
 
+/* TextOut/ExtTextOut: rasterise the run with the DC's font (FreeType) into the
+ * DC's selected 32-bpp DIB, in the DC's text colour. MapleStory renders every UI
+ * text label this way — CreateDIBSection, TextOut, then the DIB is uploaded as a
+ * texture — so without this the labels (Register/Quit/Ver/... ) come out blank.
+ * Covered pixels get the text colour in RGB and the glyph coverage in alpha, so
+ * the result reads correctly whether the engine blends by alpha or keys on black.
+ * TA_* alignment (left/centre/right, top/baseline/bottom) is honoured. */
+static uint32_t text_out(CPU *c, const uint32_t *a, int wide, int ext) {
+    UNUSED;
+    uint32_t str = ext ? a[5] : a[3];
+    uint32_t count = ext ? a[6] : a[4];
+    pthread_mutex_lock(&gdi_mu);
+    GdiObj *dc = get(a[0], O_DC);
+    GdiObj *fo = dc ? get(dc->u.dc.font, O_FONT) : NULL;
+    GdiObj *bm = dc ? get(dc->u.dc.bitmap, O_BITMAP) : NULL;
+    Font *f = fo && fo->u.font.ft ? &fo->u.font : NULL;
+    if (getenv("RECOMP_TRACE_TEXT")) {
+        char s[64]; unsigned i=0; for (; i<64-1 && i<(ext?a[6]:a[4]); i++) s[i]=(char)(wide?ld16((ext?a[5]:a[3])+2*i):ld8((ext?a[5]:a[3])+i)); s[i]=0;
+        rt_log("[text] hdc=%x font=%p bmp=%x bpp=%d bits=%x align=%x col=%06x \"%s\"\n",
+               a[0], (void*)(f?f->ft:0), dc?dc->u.dc.bitmap:0, bm?bm->u.bmp.bpp:-1,
+               bm?bm->u.bmp.bits:0, dc?dc->u.dc.text_align:0, dc?dc->u.dc.text_color:0, s);
+    }
+    int bpp = bm ? bm->u.bmp.bpp : 0;
+    if (!dc || !f || !bm || !bm->u.bmp.bits || (bpp != 16 && bpp != 32) || (int)count <= 0) {
+        pthread_mutex_unlock(&gdi_mu);
+        return 1;
+    }
+    FT_Face ft = f->ft;
+    int W = bm->u.bmp.w, H = bm->u.bmp.h;
+    uint32_t pitch = (uint32_t)(((W * bpp + 31) / 32) * 4);
+    int topdown = bm->u.bmp.topdown;
+    uint32_t color = dc->u.dc.text_color;
+    uint8_t tr = color & 0xFF, tg = (color >> 8) & 0xFF, tb = (color >> 16) & 0xFF;
+    int ascent = (int)(ft->size->metrics.ascender >> 6);
+    int descent = (int)(-(ft->size->metrics.descender >> 6));
+    uint32_t align = dc->u.dc.text_align;
+
+    /* decode the run into Unicode code points */
+    uint32_t cp[1024];
+    uint32_t n = count < 1024 ? count : 1024;
+    for (uint32_t i = 0; i < n; i++) cp[i] = wide ? ld16(str + 2 * i) : ld8(str + i);
+
+    /* total advance, for centre/right alignment */
+    int total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (FT_Load_Char(ft, cp[i], FT_LOAD_DEFAULT)) continue;
+        total += (int)(ft->glyph->advance.x >> 6);
+    }
+    int x = (int)a[1], y = (int)a[2];
+    if ((align & 6) == 6) x -= total / 2;       /* TA_CENTER */
+    else if ((align & 6) == 2) x -= total;      /* TA_RIGHT */
+    int top;                                     /* y of the glyph-box top */
+    if ((align & 24) == 24) top = y - ascent;    /* TA_BASELINE */
+    else if ((align & 24) == 8) top = y - ascent - descent; /* TA_BOTTOM */
+    else top = y;                                /* TA_TOP (default) */
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (FT_Load_Char(ft, cp[i], FT_LOAD_DEFAULT) || FT_Render_Glyph(ft->glyph, FT_RENDER_MODE_NORMAL)) continue;
+        FT_GlyphSlot g = ft->glyph;
+        FT_Bitmap *gb = &g->bitmap;
+        int ox = x + g->bitmap_left;
+        int oy = top + ascent - g->bitmap_top;
+        for (int gy = 0; gy < (int)gb->rows; gy++) {
+            int py = oy + gy;
+            if (py < 0 || py >= H) continue;
+            const uint8_t *srow = gb->buffer + (ptrdiff_t)gy * gb->pitch;
+            int diby = topdown ? py : (H - 1 - py);
+            for (int gx = 0; gx < (int)gb->width; gx++) {
+                uint8_t cov = srow[gx];
+                if (!cov) continue;
+                int px = ox + gx;
+                if (px < 0 || px >= W) continue;
+                if (bpp == 32) {
+                    uint32_t off = bm->u.bmp.bits + (uint32_t)diby * pitch + (uint32_t)px * 4;
+                    st8(off + 0, tb);
+                    st8(off + 1, tg);
+                    st8(off + 2, tr);
+                    uint8_t olda = ld8(off + 3);
+                    st8(off + 3, cov > olda ? cov : olda);
+                } else { /* 16-bpp RGB565: no alpha, so blend the colour over the pixel */
+                    uint32_t off = bm->u.bmp.bits + (uint32_t)diby * pitch + (uint32_t)px * 2;
+                    uint16_t old = ld16(off);
+                    uint8_t orr = (uint8_t)(((old >> 11) & 0x1F) * 255 / 31);
+                    uint8_t og = (uint8_t)(((old >> 5) & 0x3F) * 255 / 63);
+                    uint8_t ob = (uint8_t)((old & 0x1F) * 255 / 31);
+                    uint8_t nr = (uint8_t)((tr * cov + orr * (255 - cov)) / 255);
+                    uint8_t ng = (uint8_t)((tg * cov + og * (255 - cov)) / 255);
+                    uint8_t nb = (uint8_t)((tb * cov + ob * (255 - cov)) / 255);
+                    st16(off, (uint16_t)(((nr >> 3) << 11) | ((ng >> 2) << 5) | (nb >> 3)));
+                }
+            }
+        }
+        x += (int)(g->advance.x >> 6);
+    }
+    pthread_mutex_unlock(&gdi_mu);
+    return 1;
+}
+H(gdi_TextOutA) { return text_out(c, a, 0, 0); }
+H(gdi_TextOutW) { return text_out(c, a, 1, 0); }
+H(gdi_ExtTextOutA) { return text_out(c, a, 0, 1); }
+H(gdi_ExtTextOutW) { return text_out(c, a, 1, 1); }
+
 /* GetFontUnicodeRanges(hdc, GLYPHSET*): the characters the font maps, as ranges. */
 H(gdi_GetFontUnicodeRanges) {
     pthread_mutex_lock(&gdi_mu);
@@ -535,8 +637,10 @@ static uint32_t new_bitmap(int w, int h, int bpp, int alloc) {
 H(gdi_CreateDIBSection) {
     UNUSED;
     INIT();
-    uint32_t hb = new_bitmap((int32_t)ld32(a[1] + 4), (int32_t)ld32(a[1] + 8), ld16(a[1] + 14), 1);
+    int32_t biHeight = (int32_t)ld32(a[1] + 8);
+    uint32_t hb = new_bitmap((int32_t)ld32(a[1] + 4), biHeight, ld16(a[1] + 14), 1);
     GdiObj *b = get(hb, O_BITMAP);
+    if (b) b->u.bmp.topdown = biHeight < 0; /* negative height: rows top-to-bottom */
     if (a[3]) st32(a[3], b ? b->u.bmp.bits : 0);
     pthread_mutex_unlock(&gdi_mu);
     return hb;
@@ -648,9 +752,9 @@ static const ImportDef defs[] = {
     {"gdi32.dll", "BitBlt", gdi_true, 9, 0},
     {"gdi32.dll", "StretchBlt", gdi_true, 11, 0},
     {"gdi32.dll", "PatBlt", gdi_true, 6, 0},
-    {"gdi32.dll", "TextOutW", gdi_true, 5, 0},
-    {"gdi32.dll", "TextOutA", gdi_true, 5, 0},
-    {"gdi32.dll", "ExtTextOutW", gdi_true, 8, 0},
-    {"gdi32.dll", "ExtTextOutA", gdi_true, 8, 0},
+    {"gdi32.dll", "TextOutW", gdi_TextOutW, 5, 0},
+    {"gdi32.dll", "TextOutA", gdi_TextOutA, 5, 0},
+    {"gdi32.dll", "ExtTextOutW", gdi_ExtTextOutW, 8, 0},
+    {"gdi32.dll", "ExtTextOutA", gdi_ExtTextOutA, 8, 0},
 };
 RT_EXPORT_IMPORTS(rt_imports_gdi, defs);
