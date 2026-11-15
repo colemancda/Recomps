@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "com.h"
@@ -268,9 +269,21 @@ static int read_format(DsBuffer *b, uint32_t p) {
     return 1;
 }
 
+H(dsb_AddRef);
 H(dsb_QueryInterface) {
     UNUSED;
     char g[40];
+    /* IDirectSoundBuffer8 and IDirectSoundBuffer: the same object */
+    static const uint8_t iid_buffer8[16] = {0x49, 0xa4, 0x25, 0x68, 0x24, 0x75, 0x82, 0x4d,
+                                            0x92, 0x0f, 0x50, 0xe3, 0x6a, 0xb3, 0xab, 0x1e};
+    static const uint8_t iid_buffer[16] = {0x85, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11,
+                                           0xa5, 0x21, 0x00, 0x20, 0xaf, 0x0b, 0xe5, 0x60};
+    if (a[1] && a[2] && (!memcmp(G(a[1]), iid_buffer8, 16) || !memcmp(G(a[1]), iid_buffer, 16))) {
+        uint32_t ref[1] = {a[0]};
+        dsb_AddRef(c, ref);
+        st32(a[2], a[0]);
+        return DS_OK;
+    }
     if (g_opt.verbose) rt_log("[dsound] IDirectSoundBuffer::QueryInterface(%s): not provided\n", rt_guid_str(a[1], g));
     if (a[2]) st32(a[2], 0);
     return E_NOINTERFACE;
@@ -610,7 +623,45 @@ H(ds_DirectSoundCreate8) {
     return DS_OK;
 }
 
+/* DirectSoundEnumerateA/W(callback, context): callback(GUID *, description, module,
+ * context), stdcall, returns FALSE to stop. One device: the primary sound driver
+ * (GUID NULL), then the mixer itself under a GUID of its own. No devices with
+ * --no-sound. */
+static uint32_t ds_enumerate(CPU *c, const uint32_t *a, int wide) {
+    if (g_opt.no_sound || !a[0]) return DS_OK;
+    static uint32_t guid, names[2][2];
+    static const char *const text[2][2] = {{"Primary Sound Driver", ""}, {"Recomp software mixer", "recomp"}};
+    if (!guid) {
+        uint32_t g = rt_heap_alloc(16, 0);
+        static const uint8_t bytes[16] = {0x3e, 0x7a, 0x1f, 0x52, 0x8c, 0x01, 0x4d, 0x4b,
+                                          0x9a, 0x51, 0x72, 0x65, 0x63, 0x6f, 0x6d, 0x70};
+        for (int i = 0; i < 16; i++) st8(g + (uint32_t)i, bytes[i]);
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                if (wide) {
+                    names[i][j] = rt_wstr_dup(text[i][j]);
+                } else {
+                    size_t n = strlen(text[i][j]) + 1;
+                    names[i][j] = rt_heap_alloc((uint32_t)n, 0);
+                    memcpy(G(names[i][j]), text[i][j], n);
+                }
+            }
+        guid = g;
+    }
+    for (int i = 0; i < 2; i++) {
+        uint32_t args[4] = {i ? guid : 0, names[i][0], names[i][1], a[1]}, r = 0;
+        if (!rt_call_guest(c, a[0], RT_STDCALL, 4, args, &r)) return 0;
+        if (!r) break;
+    }
+    return DS_OK;
+}
+H(ds_DirectSoundEnumerateA) { return ds_enumerate(c, a, 0); }
+H(ds_DirectSoundEnumerateW) { return ds_enumerate(c, a, 1); }
+
 static const ImportDef defs[] = {
     {"dsound.dll", "DirectSoundCreate8", ds_DirectSoundCreate8, 3, 0},
+    {"dsound.dll", "DirectSoundCreate", ds_DirectSoundCreate8, 3, 0},
+    {"dsound.dll", "DirectSoundEnumerateA", ds_DirectSoundEnumerateA, 2, 0},
+    {"dsound.dll", "DirectSoundEnumerateW", ds_DirectSoundEnumerateW, 2, 0},
 };
 RT_EXPORT_IMPORTS(rt_imports_dsound, defs);
