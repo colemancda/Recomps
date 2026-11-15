@@ -14,6 +14,8 @@
 #include <stdlib.h>
 
 #include "com.h"
+#include "d3d8.h"
+#include "user.h"
 #include "rt.h"
 #include "video.h"
 
@@ -21,67 +23,17 @@
 #define D3DERR_NOTAVAILABLE 0x8876086Au
 #define D3DERR_INVALIDCALL 0x8876086Cu
 
-enum { K_FREE = 0, K_D3D, K_DEVICE, K_TEXTURE, K_SURFACE, K_VB, K_IB, K_SWAPCHAIN };
 #define MAGIC(k) (0xD3D80000u | (k))
-
-/* D3DFORMAT values used here. */
-enum {
-    FMT_R8G8B8 = 20, FMT_A8R8G8B8 = 21, FMT_X8R8G8B8 = 22, FMT_R5G6B5 = 23, FMT_X1R5G5B5 = 24,
-    FMT_A1R5G5B5 = 25, FMT_A4R4G4B4 = 26, FMT_R3G3B2 = 27, FMT_A8 = 28, FMT_A8R3G3B2 = 29,
-    FMT_X4R4G4B4 = 30, FMT_A8P8 = 40, FMT_P8 = 41, FMT_L8 = 50, FMT_A8L8 = 51, FMT_A4L4 = 52,
-    FMT_D16_LOCKABLE = 70, FMT_D32 = 71, FMT_D15S1 = 73, FMT_D24S8 = 75, FMT_D24X8 = 77, FMT_D24X4S4 = 79,
-    FMT_D16 = 80, FMT_INDEX16 = 101, FMT_INDEX32 = 102,
-    FMT_DXT1 = 0x31545844, FMT_DXT2 = 0x32545844, FMT_DXT3 = 0x33545844, FMT_DXT4 = 0x34545844,
-    FMT_DXT5 = 0x35545844,
-};
 /* D3DRESOURCETYPE */
 enum { RT_SURFACE = 1, RT_TEXTURE = 3, RT_VERTEXBUFFER = 6, RT_INDEXBUFFER = 7 };
 
-typedef struct Obj {
-    int kind;
-    uint32_t obj; /* guest object */
-    int refs;
-    /* surfaces and textures */
-    uint32_t width, height, format, usage, pool, levels;
-    uint32_t data, pitch, bytes; /* surface: guest memory; buffers: data and size */
-    int container;               /* surface of a texture: the texture's index, else -1 */
-    int level_surf[16];          /* texture: the surface of each level */
-    uint32_t fvf;                /* vertex buffer */
-    uint32_t lod, priority;
-} Obj;
-
-#define MAX_OBJS 8192
-static Obj objs[MAX_OBJS];
+#define objs d3d_objs
+#define dev d3d_dev
+#define MAX_OBJS D3D_MAX_OBJS
+Obj d3d_objs[D3D_MAX_OBJS];
 static int nobjs;
 static uint32_t vt_d3d, vt_device, vt_texture, vt_surface, vt_vb, vt_ib, vt_swapchain;
-
-/* The one device. */
-static struct {
-    int obj;                     /* index of the device object, -1 if none */
-    uint32_t pp[13];             /* D3DPRESENT_PARAMETERS as created */
-    uint32_t focus, flags;
-    int backbuffer, depth;       /* surface indices */
-    int render_target, zstencil; /* current */
-    uint32_t rs[256];
-    uint32_t tss[8][32];
-    int texture[8];
-    uint32_t transform[512][16];
-    uint32_t viewport[6];
-    uint32_t material[17];
-    uint32_t light[16][26];
-    uint32_t light_on[16];
-    uint32_t clip[8][4];
-    int stream[16];
-    uint32_t stride[16];
-    int indices;
-    uint32_t base_vertex;
-    uint32_t vshader, pshader;
-    uint32_t next_vshader, next_pshader, next_block;
-    uint32_t gamma[3 * 256 / 2]; /* D3DGAMMARAMP: 3 x 256 WORDs */
-    int in_scene;
-    unsigned draws, frames;
-    uint16_t *black;
-} dev = {.obj = -1};
+D3DDev d3d_dev = {.obj = -1};
 
 /* ------------------------------------------------------------- objects */
 static int obj_new(int kind) {
@@ -120,8 +72,14 @@ static int any_index(uint32_t o) {
     return (int)ld32(o + 4);
 }
 
+static void guard_check(Obj *o, const char *when);
+
 static void obj_destroy(int i) {
     Obj *ob = &objs[i];
+    if (ob->kind == K_TEXTURE) d3dgl_texture_free(ob);
+    guard_check(ob, "release");
+    if (ob->kind == K_TEXTURE)
+        for (uint32_t l = 0; l < ob->levels; l++) guard_check(&objs[ob->level_surf[l]], "release");
     if (ob->kind == K_TEXTURE)
         for (uint32_t l = 0; l < ob->levels; l++) {
             int s = ob->level_surf[l];
@@ -184,6 +142,26 @@ static int format_ok(uint32_t f) {
     }
 }
 
+/* Guard bytes after every surface and buffer: writes past the end are reported. */
+#define GUARD 64u
+static uint32_t data_alloc(uint32_t bytes) {
+    uint32_t p = rt_heap_alloc(bytes + GUARD, 1);
+    if (p) memset(G(p + bytes), 0xAB, GUARD);
+    return p;
+}
+static void guard_check(Obj *o, const char *when) {
+    if (!o->data) return;
+    for (uint32_t i = 0; i < GUARD; i++)
+        if (ld8(o->data + o->bytes + i) != 0xAB) {
+            rt_log("d3d8: %s: write past the end of a %ux%u format %#x %s (%u bytes, pitch %u) at +%u\n", when,
+                   o->width, o->height, o->format, o->kind == K_SURFACE ? "surface" : "buffer", o->bytes, o->pitch, i);
+            CPU *c = rt_cpu();
+            if (c) rt_backtrace(c);
+            memset(G(o->data + o->bytes), 0xAB, GUARD);
+            return;
+        }
+}
+
 static int surface_new(uint32_t w, uint32_t h, uint32_t fmt, uint32_t usage, uint32_t pool, int alloc) {
     int i = obj_new(K_SURFACE);
     Obj *s = &objs[i];
@@ -195,7 +173,7 @@ static int surface_new(uint32_t w, uint32_t h, uint32_t fmt, uint32_t usage, uin
     s->pitch = (row_bytes(fmt, w) + 3) & ~3u;
     s->bytes = s->pitch * rows(fmt, h);
     if (alloc) {
-        s->data = rt_heap_alloc(s->bytes ? s->bytes : 4, 1);
+        s->data = data_alloc(s->bytes ? s->bytes : 4);
         if (!s->data) {
             rt_log("d3d8: out of guest memory for a %ux%u surface\n", w, h);
             rt_exit(3);
@@ -224,6 +202,12 @@ static void lock_rect(Obj *s, uint32_t locked, uint32_t rect) {
     }
     st32(locked, s->pitch);
     st32(locked + 4, s->data + off);
+}
+
+/* The GL copy of a texture is refreshed before its next use. */
+static void mark_dirty(Obj *s) {
+    if (s->kind == K_TEXTURE) s->dirty = 1;
+    else if (s->kind == K_SURFACE && s->container >= 0) objs[s->container].dirty = 1;
 }
 
 /* -------------------------------------------------------- IUnknown parts */
@@ -334,7 +318,7 @@ static void fill_caps(uint32_t p) {
     c[39] = 0x0000003Bu;      /* VertexProcessingCaps */
     c[40] = 8;                /* MaxActiveLights */
     c[41] = 6;                /* MaxUserClipPlanes */
-    c[42] = 4;                /* MaxVertexBlendMatrices */
+    c[42] = 0;                /* MaxVertexBlendMatrices: skinning stays in the game */
     f = 1; memcpy(&c[44], &f, 4); /* MaxPointSize */
     c[45] = 0xFFFFF;          /* MaxPrimitiveCount */
     c[46] = 0xFFFFF;          /* MaxVertexIndex */
@@ -353,11 +337,69 @@ H(d3d_GetDeviceCaps) {
 }
 H(d3d_GetAdapterMonitor) { UNUSED; return 0x00010001u; }
 
+/* The render and texture stage states a new device starts with. */
+static void set_default_states(void) {
+    float one = 1.0f, zero = 0.0f;
+    uint32_t f1, f0;
+    memcpy(&f1, &one, 4);
+    memcpy(&f0, &zero, 4);
+    memset(dev.rs, 0, sizeof dev.rs);
+    dev.rs[7] = dev.pp[8] ? 1 : 0; /* ZENABLE: on with an automatic depth buffer */
+    dev.rs[8] = 3;                 /* FILLMODE solid */
+    dev.rs[9] = 2;                 /* SHADEMODE gouraud */
+    dev.rs[14] = 1;                /* ZWRITEENABLE */
+    dev.rs[16] = 1;                /* LASTPIXEL */
+    dev.rs[19] = 2;                /* SRCBLEND one */
+    dev.rs[20] = 1;                /* DESTBLEND zero */
+    dev.rs[22] = 3;                /* CULLMODE ccw */
+    dev.rs[23] = 4;                /* ZFUNC lessequal */
+    dev.rs[25] = 8;                /* ALPHAFUNC always */
+    dev.rs[37] = f1;               /* FOGEND */
+    dev.rs[38] = f1;               /* FOGDENSITY */
+    dev.rs[53] = 1, dev.rs[54] = 1, dev.rs[55] = 1; /* STENCILFAIL/ZFAIL/PASS keep */
+    dev.rs[56] = 8;                /* STENCILFUNC always */
+    dev.rs[58] = 0xFFFFFFFFu;      /* STENCILMASK */
+    dev.rs[59] = 0xFFFFFFFFu;      /* STENCILWRITEMASK */
+    dev.rs[60] = 0xFFFFFFFFu;      /* TEXTUREFACTOR */
+    dev.rs[136] = 1;               /* CLIPPING */
+    dev.rs[137] = 1;               /* LIGHTING */
+    dev.rs[141] = 1;               /* COLORVERTEX */
+    dev.rs[142] = 1;               /* LOCALVIEWER */
+    dev.rs[145] = 1;               /* DIFFUSEMATERIALSOURCE color1 */
+    dev.rs[146] = 2;               /* SPECULARMATERIALSOURCE color2 */
+    dev.rs[154] = f1;              /* POINTSIZE */
+    dev.rs[155] = f1;              /* POINTSIZE_MIN */
+    dev.rs[162] = 0xFFFFFFFFu;     /* MULTISAMPLEMASK */
+    dev.rs[168] = 0xF;             /* COLORWRITEENABLE */
+    dev.rs[171] = 1;               /* BLENDOP add */
+    (void)f0;
+    memset(dev.tss, 0, sizeof dev.tss);
+    for (int i = 0; i < 8; i++) {
+        uint32_t *t = dev.tss[i];
+        t[1] = i == 0 ? 4 : 1; /* COLOROP modulate / disable */
+        t[2] = 2;              /* COLORARG1 texture */
+        t[3] = 1;              /* COLORARG2 current */
+        t[4] = i == 0 ? 2 : 1; /* ALPHAOP selectarg1 / disable */
+        t[5] = 2;              /* ALPHAARG1 texture */
+        t[6] = 1;              /* ALPHAARG2 current */
+        t[11] = (uint32_t)i;   /* TEXCOORDINDEX */
+        t[13] = t[14] = t[25] = 1; /* ADDRESSU/V/W wrap */
+        t[16] = t[17] = 1;     /* MAG/MINFILTER point */
+        t[18] = 0;             /* MIPFILTER none */
+        t[20] = 0;             /* MAXMIPLEVEL */
+        t[21] = 1;             /* MAXANISOTROPY */
+        t[26] = t[27] = t[28] = 1; /* COLORARG0, ALPHAARG0, RESULTARG current */
+    }
+}
+
 static void device_reset(uint32_t pp) {
     for (int i = 0; i < 13; i++) dev.pp[i] = ld32(pp + 4 * (uint32_t)i);
     if (!dev.pp[0]) dev.pp[0] = 640;
     if (!dev.pp[1]) dev.pp[1] = 480;
     if (!dev.pp[2]) dev.pp[2] = FMT_R5G6B5;
+    /* A full-screen device switches the display to its mode, as on Windows (the
+     * window follows in CreateDevice and Reset, which have a guest CPU). */
+    if (!dev.pp[7]) rt_user_set_display_mode((int)dev.pp[0], (int)dev.pp[1], dev.pp[2] == FMT_R5G6B5 ? 16 : 32);
     if (dev.backbuffer >= 0 && objs[dev.backbuffer].kind == K_SURFACE) obj_destroy(dev.backbuffer);
     if (dev.depth >= 0 && objs[dev.depth].kind == K_SURFACE) obj_destroy(dev.depth);
     dev.backbuffer = surface_new(dev.pp[0], dev.pp[1], dev.pp[2], 1 /* RENDERTARGET */, 0, 1);
@@ -397,6 +439,12 @@ H(d3d_CreateDevice) {
     }
     dev.obj = obj_new(K_DEVICE);
     device_reset(a[5]);
+    set_default_states();
+    dev.gl = d3dgl_init((int)dev.pp[0], (int)dev.pp[1]);
+    if (!dev.pp[7]) {
+        uint32_t hwnd = dev.pp[6] ? dev.pp[6] : dev.focus; /* hDeviceWindow, else the focus window */
+        rt_user_fullscreen_window(c, hwnd, (int)dev.pp[0], (int)dev.pp[1], dev.pp[2] == FMT_R5G6B5 ? 16 : 32);
+    }
     rt_log("d3d8: device %ux%u format %u, %s fullscreen, flags %#x\n", dev.pp[0], dev.pp[1], dev.pp[2],
            dev.pp[7] ? "windowed" : "", a[4]);
     st32(a[6], objs[dev.obj].obj);
@@ -467,14 +515,28 @@ H(dev_ShowCursor) {
 H(dev_Reset) {
     UNUSED;
     device_reset(a[1]);
+    d3dgl_resize((int)dev.pp[0], (int)dev.pp[1]);
+    if (!dev.pp[7]) {
+        uint32_t hwnd = dev.pp[6] ? dev.pp[6] : dev.focus;
+        rt_user_fullscreen_window(c, hwnd, (int)dev.pp[0], (int)dev.pp[1], dev.pp[2] == FMT_R5G6B5 ? 16 : 32);
+    }
     return D3D_OK;
 }
+static int hashing(void);
+static uint64_t frame_hash;
 H(dev_Present) {
     UNUSED;
     dev.frames++;
     if (g_opt.verbose && dev.frames <= 3) rt_log("d3d8: frame %u: %u draws\n", dev.frames, dev.draws);
+    if (hashing()) {
+        rt_log("[d3dhash] frame %u draws %u hash %016llx\n", dev.frames, dev.draws, (unsigned long long)frame_hash);
+        frame_hash = 1469598103934665603ull;
+    }
     dev.draws = 0;
-    rt_video_present(dev.black, (int)dev.pp[0], (int)dev.pp[1], (int)dev.pp[0] * 2, 0);
+    int w, h;
+    const uint16_t *px = d3dgl_present(&w, &h);
+    if (px) rt_video_present(px, w, h, w * 2, 0);
+    else rt_video_present(dev.black, (int)dev.pp[0], (int)dev.pp[1], (int)dev.pp[0] * 2, 0);
     return D3D_OK;
 }
 H(dev_GetBackBuffer) {
@@ -538,7 +600,7 @@ static int buffer_new(int kind, uint32_t length, uint32_t usage, uint32_t fmt, u
     } else {
         b->format = fmt;
     }
-    b->data = rt_heap_alloc(length ? length : 4, 1);
+    b->data = data_alloc(length ? length : 4);
     if (!b->data) {
         rt_log("d3d8: out of guest memory for a %u-byte buffer\n", length);
         rt_exit(3);
@@ -575,6 +637,7 @@ H(dev_CreateImageSurface) {
 
 static void copy_rect(Obj *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h, Obj *dst, uint32_t dx, uint32_t dy) {
     if (!src->data || !dst->data) return;
+    mark_dirty(dst);
     if (x + w > src->width) w = src->width - x;
     if (y + h > src->height) h = src->height - y;
     if (dx + w > dst->width) w = dst->width - dx;
@@ -593,6 +656,7 @@ H(dev_CopyRects) {
     if (!s || !d || s->format != d->format) return D3DERR_INVALIDCALL;
     if (!a[3] || !a[2]) {
         copy_rect(s, 0, 0, s->width, s->height, d, 0, 0);
+        guard_check(d, "CopyRects");
         return D3D_OK;
     }
     for (uint32_t i = 0; i < a[3]; i++) {
@@ -630,7 +694,14 @@ H(dev_GetDepthStencilSurface) {
 }
 H(dev_BeginScene) { UNUSED; dev.in_scene = 1; return D3D_OK; }
 H(dev_EndScene) { UNUSED; dev.in_scene = 0; return D3D_OK; }
-H(dev_Clear) { UNUSED; return D3D_OK; }
+H(dev_Clear) {
+    /* (this, Count, pRects, Flags, Color, Z, Stencil) */
+    UNUSED;
+    float z;
+    memcpy(&z, &a[5], 4);
+    d3dgl_clear(a[1], a[2], a[3], a[4], z, a[6]);
+    return D3D_OK;
+}
 H(dev_SetTransform) {
     UNUSED;
     if (a[1] < 512) memcpy(dev.transform[a[1]], G(a[2]), 64);
@@ -711,12 +782,140 @@ H(dev_SetTextureStageState) {
 H(dev_ValidateDevice) { UNUSED; st32(a[1], 1); return D3D_OK; }
 H(dev_GetInfo) { UNUSED; return 1; /* S_FALSE: no information */ }
 H(dev_GetCurrentTexturePalette) { UNUSED; st32(a[1], 0); return D3D_OK; }
-H(dev_Draw) { UNUSED; dev.draws++; return D3D_OK; }
+/* RECOMP_D3D_HASH=1: a hash of each frame's draw stream (primitive types and counts,
+ * the vertex and index bytes used), logged at Present. It does not depend on the
+ * backend, so null-device runs on different hosts can be compared: identical
+ * hashes mean the game asked for identical pictures. */
+static int hash_on = -1;
+static uint64_t frame_hash = 1469598103934665603ull; /* FNV-1a */
+static void hash_bytes(uint32_t p, uint32_t n) {
+    if (!p || n > (64u << 20)) return;
+    const uint8_t *b = G(p);
+    uint64_t h = frame_hash;
+    for (uint32_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    frame_hash = h;
+}
+static void hash_word(uint32_t v) {
+    frame_hash = (frame_hash ^ v) * 1099511628211ull;
+}
+static uint32_t prim_vertices(uint32_t type, uint32_t prims) {
+    switch (type) {
+    case 1: return prims;
+    case 2: return prims * 2;
+    case 3: return prims + 1;
+    case 4: return prims * 3;
+    default: return prims + 2;
+    }
+}
+static int hashing(void) {
+    if (hash_on < 0) {
+        const char *e = getenv("RECOMP_D3D_HASH");
+        hash_on = e && *e && *e != '0';
+    }
+    return hash_on;
+}
+static void hash_stream0(uint32_t first, uint32_t count) {
+    Obj *vb = dev.stream[0] >= 0 ? &objs[dev.stream[0]] : NULL;
+    uint32_t stride = dev.stride[0];
+    if (!vb || !vb->data || !stride) return;
+    uint64_t off = (uint64_t)first * stride, len = (uint64_t)count * stride;
+    if (off + len > vb->bytes) return;
+    hash_bytes(vb->data + (uint32_t)off, (uint32_t)len);
+}
+
+H(dev_DrawPrimitive) {
+    UNUSED;
+    dev.draws++;
+    if (hashing()) {
+        hash_word(a[1]), hash_word(a[3]);
+        hash_stream0(a[2], prim_vertices(a[1], a[3]));
+    }
+    d3dgl_draw(a[1], a[2], a[3]);
+    return D3D_OK;
+}
+H(dev_DrawIndexedPrimitive) {
+    UNUSED;
+    dev.draws++;
+    if (hashing()) {
+        /* (type, MinIndex, NumVertices, StartIndex, PrimCount) */
+        hash_word(a[1]), hash_word(a[5]), hash_word(a[2]), hash_word(a[3]);
+        Obj *ib = dev.indices >= 0 ? &objs[dev.indices] : NULL;
+        if (ib && ib->data) {
+            uint32_t isz = ib->format == FMT_INDEX32 ? 4 : 2, n = prim_vertices(a[1], a[5]);
+            if ((uint64_t)(a[4] + n) * isz <= ib->bytes) hash_bytes(ib->data + a[4] * isz, n * isz);
+        }
+        hash_stream0(dev.base_vertex + a[2], a[3]);
+    }
+    d3dgl_draw_indexed(a[1], a[2], a[3], a[4], a[5]);
+    return D3D_OK;
+}
+H(dev_DrawPrimitiveUP) {
+    UNUSED;
+    dev.draws++;
+    if (hashing()) {
+        hash_word(a[1]), hash_word(a[2]);
+        hash_bytes(a[3], prim_vertices(a[1], a[2]) * a[4]);
+    }
+    d3dgl_draw_up(a[1], a[2], a[3], a[4]);
+    return D3D_OK;
+}
+H(dev_DrawIndexedPrimitiveUP) {
+    UNUSED;
+    dev.draws++;
+    if (hashing()) {
+        /* (type, MinIndex, NumVertices, PrimCount, pIndexData, IndexFormat, pVertexData, Stride) */
+        uint32_t n = prim_vertices(a[1], a[4]), isz = a[6] == FMT_INDEX32 ? 4 : 2;
+        hash_word(a[1]), hash_word(a[4]);
+        hash_bytes(a[5], n * isz);
+        hash_bytes(a[7] + a[2] * a[8], a[3] * a[8]);
+    }
+    d3dgl_draw_indexed_up(a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    return D3D_OK;
+}
+/* Parse a D3DVSD declaration into elements (stream, offset, type, register). */
+static void parse_decl(uint32_t p, VDecl *d) {
+    static const uint8_t type_size[8] = {4, 8, 12, 16, 4, 4, 4, 8};
+    unsigned stream = 0, offset = 0;
+    d->n = 0;
+    for (int guard = 0; guard < 256; guard++, p += 4) {
+        uint32_t t = ld32(p);
+        if (t == 0xFFFFFFFFu) break; /* D3DVSD_END */
+        switch (t >> 29) {
+        case 1: /* STREAM */
+            stream = t & 0xF;
+            offset = 0;
+            break;
+        case 2: /* STREAMDATA: REG or SKIP */
+            if (t & 0x10000000u) {
+                offset += 4 * ((t >> 16) & 0xF);
+            } else {
+                uint32_t type = (t >> 16) & 0xF, reg = t & 0x1F;
+                if (d->n < 16 && type < 8)
+                    d->e[d->n++] = (VElem){(uint8_t)stream, (uint8_t)type, (uint8_t)reg, (uint16_t)offset};
+                offset += type < 8 ? type_size[type] : 4;
+            }
+            break;
+        case 4: /* CONSTMEM: count in bits 25-28, then 4 dwords each */
+            p += 16 * ((t >> 25) & 0xF);
+            break;
+        case 5: /* EXT: count in bits 24-28 */
+            p += 4 * ((t >> 24) & 0x1F);
+            break;
+        default: break;
+        }
+    }
+}
 H(dev_CreateVertexShader) {
     /* (this, pDeclaration, pFunction, pHandle, Usage) */
     UNUSED;
-    if (a[2]) rt_log("d3d8: a vertex shader program was created; the null device ignores it\n");
-    st32(a[3], dev.next_vshader++);
+    if (a[2]) rt_log("d3d8: a vertex shader program was created; only its declaration is used\n");
+    uint32_t h = dev.next_vshader++;
+    uint32_t i = h - D3D_DECL_BASE;
+    if (i < D3D_MAX_DECLS && a[1]) {
+        dev.decl[i].used = 1;
+        parse_decl(a[1], &dev.decl[i]);
+    }
+    st32(a[3], h);
     return D3D_OK;
 }
 H(dev_SetVertexShader) { UNUSED; dev.vshader = a[1]; return D3D_OK; }
@@ -823,10 +1022,10 @@ static const ComMethod device_methods[] = {
     M(GetPaletteEntries, d3d_ok, 3),
     M(SetCurrentTexturePalette, d3d_ok, 2),
     M(GetCurrentTexturePalette, dev_GetCurrentTexturePalette, 2),
-    M(DrawPrimitive, dev_Draw, 4),
-    M(DrawIndexedPrimitive, dev_Draw, 6),
-    M(DrawPrimitiveUP, dev_Draw, 5),
-    M(DrawIndexedPrimitiveUP, dev_Draw, 9),
+    M(DrawPrimitive, dev_DrawPrimitive, 4),
+    M(DrawIndexedPrimitive, dev_DrawIndexedPrimitive, 6),
+    M(DrawPrimitiveUP, dev_DrawPrimitiveUP, 5),
+    M(DrawIndexedPrimitiveUP, dev_DrawIndexedPrimitiveUP, 9),
     M(ProcessVertices, d3d_ok, 6),
     M(CreateVertexShader, dev_CreateVertexShader, 5),
     M(SetVertexShader, dev_SetVertexShader, 2),
@@ -913,10 +1112,28 @@ H(tex_LockRect) {
     UNUSED;
     Obj *s = level(a[0], a[1]);
     if (!s) return D3DERR_INVALIDCALL;
+    mark_dirty(s);
     lock_rect(s, a[2], a[3]);
     return D3D_OK;
 }
-H(tex_UnlockRect) { UNUSED; return level(a[0], a[1]) ? D3D_OK : D3DERR_INVALIDCALL; }
+H(tex_UnlockRect) {
+    UNUSED;
+    Obj *s = level(a[0], a[1]);
+    if (s) guard_check(s, "UnlockRect"), mark_dirty(s);
+    return s ? D3D_OK : D3DERR_INVALIDCALL;
+}
+H(surf_UnlockRect) {
+    UNUSED;
+    Obj *s = get(a[0], K_SURFACE);
+    if (s) guard_check(s, "UnlockRect"), mark_dirty(s);
+    return D3D_OK;
+}
+H(buf_Unlock) {
+    UNUSED;
+    int i = any_index(a[0]);
+    if (i >= 0) guard_check(&objs[i], "Unlock");
+    return D3D_OK;
+}
 
 static const ComMethod texture_methods[] = {
     RESOURCE_METHODS,
@@ -950,7 +1167,7 @@ H(surf_LockRect) {
     Obj *s = get(a[0], K_SURFACE);
     if (!s) return D3DERR_INVALIDCALL;
     if (!s->data) {
-        s->data = rt_heap_alloc(s->bytes ? s->bytes : 4, 1); /* a depth buffer locked after all */
+        s->data = data_alloc(s->bytes ? s->bytes : 4); /* a depth buffer locked after all */
         if (!s->data) return D3DERR_INVALIDCALL;
     }
     lock_rect(s, a[1], a[2]);
@@ -968,7 +1185,7 @@ static const ComMethod surface_methods[] = {
     M(GetContainer, surf_GetContainer, 3),
     M(GetDesc, surf_GetDesc, 2),
     M(LockRect, surf_LockRect, 4),
-    M(UnlockRect, d3d_ok, 1),
+    M(UnlockRect, surf_UnlockRect, 1),
 };
 
 /* -------------------------------------------- vertex and index buffers */
@@ -997,13 +1214,13 @@ H(buf_GetDesc) {
 static const ComMethod vb_methods[] = {
     RESOURCE_METHODS,
     M(Lock, buf_Lock, 5),
-    M(Unlock, d3d_ok, 1),
+    M(Unlock, buf_Unlock, 1),
     M(GetDesc, buf_GetDesc, 2),
 };
 static const ComMethod ib_methods[] = {
     RESOURCE_METHODS,
     M(Lock, buf_Lock, 5),
-    M(Unlock, d3d_ok, 1),
+    M(Unlock, buf_Unlock, 1),
     M(GetDesc, buf_GetDesc, 2),
 };
 static const ComMethod swapchain_methods[] = {
