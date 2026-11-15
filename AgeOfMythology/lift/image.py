@@ -23,6 +23,7 @@ class Image:
         self.sections = sections
         self.imports = imports  # list of (iat_va, dll, name)
         self.end = base + len(data)
+        self.reloc_slots = set()  # addresses of relocated words (PEs with .reloc)
 
     @classmethod
     def from_pe(cls, path, rebase=None):
@@ -73,7 +74,14 @@ class Image:
                 name = e.name.decode("latin1") if e.name else "ord%d" % e.ordinal
                 exports.append((base + e.address, name))
         entry = base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
-        return cls(base, data, text_start, text_end, entry, sections, imports, exports, pref_base=pref)
+        img = cls(base, data, text_start, text_end, entry, sections, imports, exports, pref_base=pref)
+        # Addresses of the words the base relocations patch: certainly pointers.
+        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
+        for blk in getattr(pe, "DIRECTORY_ENTRY_BASERELOC", []):
+            for e in blk.entries:
+                if e.type == 3:  # HIGHLOW
+                    img.reloc_slots.add(base + e.rva)
+        return img
 
     @classmethod
     def from_raw(cls, path, base):
