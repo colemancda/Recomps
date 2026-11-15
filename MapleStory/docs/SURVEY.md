@@ -50,10 +50,49 @@ automatically. With it, 74,684 functions are lifted.
 C++ static initialisers, as real lifted code. Reached so far, each a Win32 call
 that succeeds: `WSAStartup`, file enumeration of the game folder
 (`FindFirstFile`/`FindNextFile`), resource loading, a mutex, `inet_addr`,
-`ntohl`/`ntohs`, `CoInitialize`, `OpenProcessToken`. The boot currently stops at
-the next unimplemented import (`advapi32!LookupPrivilegeValueA`); from here it is
-the usual step-2 work of filling import handlers one blocker at a time.
+`ntohl`/`ntohs`, `CoInitialize`, `OpenProcessToken`. Filling imports one blocker
+at a time (privileges, CryptoAPI, COM error info, dialogs, `FindWindow`) carried
+the boot through CRT start-up and into the engine load; see the sections below
+for the engine DLLs and the GameGuard frontier where it now stops.
 
-Added so far: `ntohl`/`ntohs` (Winsock), the GameGuard/ijl15/WzMss stubs, and the
-MapleStory module list. The engine DLLs (Canvas, Gr2D_DX8, Sound_DX8, …) are not
-lifted yet; they are added as the boot reaches their COM activation.
+Imports added in `runtime/`: `ntohl`/`ntohs` (Winsock); token privileges, the
+CryptoAPI set and COM error info (stubs.c); `DialogBoxParam`/`FindWindow`
+(user32.c); and the GameGuard/ijl15/WzMss stubs and MapleStory module list.
+
+## Engine DLLs and msvcrt (step 1 continued)
+
+The client loads the Wizet engine DLLs at start-up. All are now lifted and linked
+(bases are each DLL's own ImageBase, non-conflicting): PCOM, NameSpace, ResMan,
+Shape2D, Canvas, Gr2D_DX8, Sound_DX8, and ijl15. Ghidra exports range from 276
+(ResMan) to 1431 (Sound_DX8) functions each. Unlike the EXE, these DLLs link the
+dynamic `msvcrt.dll` (41 distinct imports: malloc/free, memcpy, sprintf, the math
+functions, C++ exception handling and `_initterm`). `msvcrt.dll` (the VC6 system
+runtime, the same build Age of Mythology uses) is lifted too, at 0x78000000; it
+is a Microsoft system DLL, kept in the ignored `orig/`. `build.sh` now applies
+the data-section code-pointer merge to every module, not just the EXE.
+
+With these, the client loads and initialises all engine DLLs and runs their CRT
+start-up, then reaches GameGuard.
+
+## GameGuard (the current frontier)
+
+Start-up runs into nProtect GameGuard's anti-hack layer, woven into the client's
+C++ static initialisers (not just the stubbed `npkcrypt` imports):
+
+- **0x672c93** — a scanner run from a static constructor. It enumerates files
+  with `FindFirstFileA("*")`, decrypts a blocklist of cheat-tool names (encrypted
+  bytes at 0x96a0f0, 0x96a104, 0x96a118, … decoded by `FUN_00865f61`), and
+  compares each file with `lstrcmpiA`; on a match it shows a Korean "close the
+  hacking program and restart" MessageBox (caption "Error Message") and calls
+  `ExitProcess`.
+- Past the scanner, GameGuard resolves Win32 APIs indirectly into a pointer table
+  around **0x97b384** (no direct `mov [0x97b384], reg` writes exist — the address
+  is computed into a register and stored through it) and calls through those
+  slots. Hooking the scanner alone is not enough: the table must be populated or
+  each call site handled.
+
+Defeating this obfuscated layer — identifying every anti-hack entry point and
+either neutralising the checks or emulating the GameGuard responses the client
+expects — is the next focused effort. Until then the recompiled client boots
+through its entire CRT and engine initialisation and stops at the scanner, which
+is a clean, reproducible checkpoint.
