@@ -423,6 +423,38 @@ H(oa_GetErrorInfo) {
     return 1; /* S_FALSE: no error object */
 }
 H(oa_SetErrorInfo) { UNUSED; return 0; /* S_OK */ }
+/* CreateErrorInfo (oleaut32 ordinal 202): hands back an ICreateErrorInfo the
+ * caller fills in (SetDescription, SetSource, ...) and passes to SetErrorInfo.
+ * The engine DLLs use it on their COM error paths. SetErrorInfo discards the
+ * object here, so the setters need only succeed and QueryInterface need only
+ * hand the same object back (for the IErrorInfo QI that SetErrorInfo would do). */
+static uint32_t vt_create_errorinfo;
+H(cei_QueryInterface) {
+    UNUSED; /* (this, iid, ppv) */
+    if (a[2]) st32(a[2], a[0]);
+    return S_OK;
+}
+H(cei_AddRef) { UNUSED; return 1; }
+H(cei_Release) { UNUSED; return 1; }
+H(cei_set_ok) { UNUSED; return S_OK; } /* SetGUID/SetSource/SetDescription/SetHelpFile/SetHelpContext */
+H(oa_CreateErrorInfo) {
+    UNUSED; /* (ICreateErrorInfo** pperrinfo) */
+    static const ComMethod methods[] = {
+        {"QueryInterface", cei_QueryInterface, 3},
+        {"AddRef", cei_AddRef, 1},
+        {"Release", cei_Release, 1},
+        {"SetGUID", cei_set_ok, 2},
+        {"SetSource", cei_set_ok, 2},
+        {"SetDescription", cei_set_ok, 2},
+        {"SetHelpFile", cei_set_ok, 2},
+        {"SetHelpContext", cei_set_ok, 2},
+    };
+    if (!vt_create_errorinfo)
+        vt_create_errorinfo = rt_com_vtable("oleaut32.dll", "ICreateErrorInfo", methods, RT_COUNTOF(methods));
+    uint32_t obj = rt_com_object(vt_create_errorinfo, 0, 0x4552524Fu /* 'ERRO' */);
+    if (a[0]) st32(a[0], obj);
+    return S_OK;
+}
 /* IUnknown::AddRef / Release of a guest object */
 static void com_call(CPU *c, uint32_t obj, int slot) {
     uint32_t r, args[1] = {obj};
@@ -446,6 +478,32 @@ H(oa_VariantCopy) {
     uint16_t vt = ld16(a[1]);
     if (vt == VT_BSTR && ld32(a[1] + 8)) st32(a[0] + 8, bstr_alloc(ld32(a[1] + 8), ld32(ld32(a[1] + 8) - 4)));
     if (vt == VT_UNKNOWN || vt == VT_DISPATCH) com_call(c, ld32(a[1] + 8), 1);
+    return 0;
+}
+/* VariantCopyInd(dst, src): VariantCopy, but a VT_BYREF source is dereferenced
+ * one level so the destination holds the referenced value, not the reference. */
+H(oa_VariantCopyInd) {
+    uint16_t vt = ld16(a[1]);
+    if (!(vt & VT_BYREF)) {
+        uint32_t args[2] = {a[0], a[1]};
+        return oa_VariantCopy(c, args);
+    }
+    uint16_t base = vt & ~VT_BYREF;
+    uint32_t ref = ld32(a[1] + 8); /* the pointer the source holds */
+    uint32_t args[1] = {a[0]};
+    oa_VariantClear(c, args);
+    memset(G(a[0]), 0, 16);
+    st16(a[0], base);
+    if (base == VT_BSTR) {
+        uint32_t bs = ref ? ld32(ref) : 0;
+        st32(a[0] + 8, bs ? bstr_alloc(bs, ld32(bs - 4)) : 0);
+    } else if (base == VT_UNKNOWN || base == VT_DISPATCH) {
+        uint32_t p = ref ? ld32(ref) : 0;
+        st32(a[0] + 8, p);
+        if (p) com_call(c, p, 1); /* AddRef */
+    } else if (ref) {
+        memcpy(G(a[0] + 8), G(ref), 8); /* value types: the 8-byte payload union */
+    }
     return 0;
 }
 /* VariantChangeType(dst, src, flags, vt): the conversions to and from strings and integers. */
@@ -515,7 +573,35 @@ H(ver_GetFileVersionInfoSize) {
     return 0;
 }
 
+/* ------------------------------------------------------- wininet (auto-updater)
+ * The client's updater thread opens an FTP connection to fetch patches. Report
+ * that the server cannot be reached, so it concludes there is nothing to update
+ * and the client proceeds to the login screen (the retail client does the same
+ * when the patch server is down). */
+#define ERROR_INTERNET_CANNOT_CONNECT 12029u
+H(wi_InternetOpenA) { UNUSED; return 0xC0DE0500u; } /* a session handle */
+H(wi_InternetConnectA) {
+    rt_set_last_error(c, ERROR_INTERNET_CANNOT_CONNECT);
+    return 0;
+}
+H(wi_FtpOpenFileA) {
+    rt_set_last_error(c, ERROR_INTERNET_CANNOT_CONNECT);
+    return 0;
+}
+H(wi_FtpGetFileSize) { UNUSED; return 0xFFFFFFFFu; }
+H(wi_FtpGetFileA) {
+    rt_set_last_error(c, ERROR_INTERNET_CANNOT_CONNECT);
+    return 0;
+}
+H(wi_InternetCloseHandle) { UNUSED; return 1; }
+
 static const ImportDef defs[] = {
+    {"wininet.dll", "InternetOpenA", wi_InternetOpenA, 5, 0},
+    {"wininet.dll", "InternetConnectA", wi_InternetConnectA, 8, 0},
+    {"wininet.dll", "FtpOpenFileA", wi_FtpOpenFileA, 5, 0},
+    {"wininet.dll", "FtpGetFileSize", wi_FtpGetFileSize, 2, 0},
+    {"wininet.dll", "FtpGetFileA", wi_FtpGetFileA, 7, 0},
+    {"wininet.dll", "InternetCloseHandle", wi_InternetCloseHandle, 1, 0},
     {"winmm.dll", "timeBeginPeriod", mm_timeBeginPeriod, 1, 0},
     {"winmm.dll", "timeEndPeriod", mm_timeBeginPeriod, 1, 0},
     {"winmm.dll", "waveOutGetNumDevs", st_zero, 0, 0},
@@ -600,7 +686,11 @@ static const ImportDef defs[] = {
     {"oleaut32.dll", "#2", oa_SysAllocString, 1, 0},
     {"oleaut32.dll", "SysAllocString", oa_SysAllocString, 1, 0},
     {"oleaut32.dll", "GetErrorInfo", oa_GetErrorInfo, 2, 0},
+    {"oleaut32.dll", "#200", oa_GetErrorInfo, 2, 0},
     {"oleaut32.dll", "SetErrorInfo", oa_SetErrorInfo, 2, 0},
+    {"oleaut32.dll", "#201", oa_SetErrorInfo, 2, 0},
+    {"oleaut32.dll", "CreateErrorInfo", oa_CreateErrorInfo, 1, 0},
+    {"oleaut32.dll", "#202", oa_CreateErrorInfo, 1, 0},
     {"oleaut32.dll", "#3", oa_SysReAllocString, 2, 0},
     {"oleaut32.dll", "#4", oa_SysAllocStringLen, 2, 0},
     {"oleaut32.dll", "SysAllocStringLen", oa_SysAllocStringLen, 2, 0},
@@ -615,6 +705,8 @@ static const ImportDef defs[] = {
     {"oleaut32.dll", "VariantClear", oa_VariantClear, 1, 0},
     {"oleaut32.dll", "#10", oa_VariantCopy, 2, 0},
     {"oleaut32.dll", "VariantCopy", oa_VariantCopy, 2, 0},
+    {"oleaut32.dll", "#11", oa_VariantCopyInd, 2, 0},
+    {"oleaut32.dll", "VariantCopyInd", oa_VariantCopyInd, 2, 0},
     {"oleaut32.dll", "#12", oa_VariantChangeType, 4, 0},
     {"oleaut32.dll", "VariantChangeType", oa_VariantChangeType, 4, 0},
     {"oleaut32.dll", "#149", oa_SysStringByteLen, 1, 0},
