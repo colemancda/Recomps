@@ -97,6 +97,7 @@ static inline GuestFn rt_lookup(uint32_t a) {
 }
 
 void rt_call_slow(CPU *c, uint32_t addr);
+void rt_hook(CPU *c, uint32_t addr); /* a guest function replaced by a host handler (lift.py --hook) */
 void rt_jmp_slow(CPU *c, uint32_t addr, uint32_t from);
 int rt_ret_mismatch(CPU *c, uint32_t expected, uint32_t slot);
 void rt_unimplemented_insn(CPU *c, uint32_t addr, const char *mnemonic) __attribute__((noreturn));
