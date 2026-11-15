@@ -1008,6 +1008,7 @@ H(user_DispatchMessageA) {
 
 H(user_PostQuitMessage) {
     pthread_once(&user_once, user_init);
+    if (getenv("RECOMP_TRACE_EXIT")) { rt_log("\nPostQuitMessage(%u) called:\n", a[0]); rt_backtrace(c); }
     pthread_mutex_lock(&user_mu);
     MsgQueue *q = queue_of(rt_thread_of(c));
     q->quit = 1;
