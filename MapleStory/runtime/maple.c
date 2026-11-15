@@ -28,13 +28,16 @@ H(npk_msg) { UNUSED; return 0x8000; }          /* NPKRegisterCryptWindowMsg: a m
 H(wz_soap_fail) { UNUSED; return 1; }
 
 static const ImportDef defs[] = {
-    {"npkcrypt.dll", "NPKOpenDriver", npk_open, 1, 0},
+    /* Arg counts match the call sites in FUN_00867060 (KeyCrypt init); these are
+     * __stdcall, so a wrong count corrupts the guest stack when the callee cleans
+     * up — which only bites once KeyCrypt init takes the success path. */
+    {"npkcrypt.dll", "NPKOpenDriver", npk_open, 0, 0},
     {"npkcrypt.dll", "NPKCloseDriver", npk_zero, 0, 0},
     {"npkcrypt.dll", "NPKLoadAtStartup", npk_ok, 1, 0},
     {"npkcrypt.dll", "NPKSetDrvPath", npk_ok, 1, 0},
-    {"npkcrypt.dll", "NPKGetAppCompatFlag", npk_compat_ok, 0, 0},
-    {"npkcrypt.dll", "NPKSetAppCompatFlag", npk_zero, 1, 0},
-    {"npkcrypt.dll", "NPKRegisterCryptWindowMsg", npk_msg, 1, 0},
+    {"npkcrypt.dll", "NPKGetAppCompatFlag", npk_compat_ok, 1, 0},
+    {"npkcrypt.dll", "NPKSetAppCompatFlag", npk_zero, 2, 0},
+    {"npkcrypt.dll", "NPKRegisterCryptWindowMsg", npk_msg, 3, 0},
 
     {"wzmss.dll", "?WzSoap_GetArticleContent@@YAJEH_NPBGPAG@Z", wz_soap_fail, 5, 0},
     {"wzmss.dll", "?WzSoap_CommentArticle@@YAJEHPBGEH00H_NPAG@Z", wz_soap_fail, 11, 0},
