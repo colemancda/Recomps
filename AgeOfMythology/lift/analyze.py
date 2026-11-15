@@ -191,11 +191,13 @@ class Analysis:
                 return True
         return False
 
-    def plausible_code(self, a):
-        """Does undiscovered address `a` look like the start of real code?"""
+    def plausible_code(self, a, known_pointer=False):
+        """Does undiscovered address `a` look like the start of real code?
+
+        known_pointer: a relocated data word holds `a`, so what precedes it does not matter."""
         img = self.img
         o = a - img.text_start
-        if o > 0 and self.cover[o - 1] == 0:
+        if o > 0 and self.cover[o - 1] == 0 and not known_pointer:
             prev = img.u8(a - 1)
             ret_n = o >= 3 and img.u8(a - 3) == 0xC2 and img.u8(a - 1) == 0
             if prev not in (0xCC, 0xC3, 0x90) and not ret_n and (a & 0xF):
@@ -205,7 +207,7 @@ class Analysis:
             if not img.in_text(a) or self.in_table(a):
                 return False
             c = self.cover[a - img.text_start]
-            if c == 2:
+            if c == 2 and not known_pointer:
                 return False
             if c == 1:
                 return True
@@ -240,10 +242,24 @@ class Analysis:
             if img.is_code_section(sec):
                 continue
             n = min(sec.vsize, sec.rawsize, img.end - sec.va)
+            in_text = lambda o: 0 <= o < n - 3 and img.text_start <= img.u32(sec.va + o) < img.text_end
             for off in range(0, n - 3, 4):
                 v = img.u32(sec.va + off)
                 if img.text_start <= v < img.text_end:
-                    data_cands[v] = "data"
+                    if sec.va + off in img.reloc_slots:
+                        kind = "reloc"
+                    elif in_text(off - 4) or in_text(off + 4):
+                        kind = "data-vt"  # beside other code pointers: a vtable or function table
+                    else:
+                        kind = "data"
+                    data_cands[v] = kind
+        # Relocated words inside code sections are pointers too: vtables and jump
+        # tables placed in .text (msxml4 has no .rdata), and absolute operands.
+        for slot in img.reloc_slots:
+            if img.in_text(slot) and img.has(slot, 4):
+                v = img.u32(slot)
+                if img.text_start <= v < img.text_end:
+                    data_cands.setdefault(v, "reloc")
         first = True
         while True:
             cands = {}
@@ -263,6 +279,8 @@ class Analysis:
             new = 0
             for v in sorted(cands):
                 kind = cands[v]
+                if data_cands.get(v) == "reloc":
+                    kind = "reloc"  # the relocation table proves it a pointer, however else it appears
                 if v in self.starts or self.in_table(v):
                     continue
                 cv = self.cover[v - img.text_start]
@@ -272,7 +290,7 @@ class Analysis:
                     # the earlier decode ran on from text placed just before it (Granny's
                     # CRT initialiser follows a string in .text). Immediates are not
                     # trusted that far.
-                    if kind == "data" and self.plausible_code(v):
+                    if kind in ("data", "data-vt", "reloc") and self.plausible_code(v, kind == "reloc"):
                         new += self.add_start(v, "data-overlap")
                         self.explore()
                     else:
@@ -281,11 +299,11 @@ class Analysis:
                     # A pointer to the middle of a known function: an SEH filter/handler label
                     # or similar. Values shaped like 0x00XX00YY are far more often UTF-16 text
                     # or round constants than code pointers, so those are not promoted.
-                    if v & 0xFF00:
+                    if v & 0xFF00 or kind in ("data-vt", "reloc"):
                         new += self.add_start(v, kind + "-label")
                     else:
                         self.rejected_ptrs += 1
-                elif self.plausible_code(v):
+                elif self.plausible_code(v, kind == "reloc"):
                     new += self.add_start(v, kind + "-code")
                     self.explore()
                 else:
