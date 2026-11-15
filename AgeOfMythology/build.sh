@@ -34,17 +34,33 @@ out="$build/$target$variant"
 jobs="${JOBS:-$(nproc)}"
 opt="${OPT:--O1}"
 
-# module  file             lift base (empty: the PE's own)   function list (optional)
-# The EXE comes first: the runtime takes rt_images[0] as the program.
+# module  file             lift base (empty: the PE's own)   function list (optional)   hooks
+# The EXE comes first: the runtime takes rt_images[0] as the program. Hooks are
+# functions replaced by host handlers (runtime/aom.c, rt_hooks[]).
 modules=(
-    "aomx     aomx.exe       -           $build/survey/aomx.functions.csv"
-    "msvcrt   msvcrt.dll     -           -"
-    "msvcp60  msvcp60.dll    -           -"
-    "rockall  rockalldll.dll -           -"
-    "granny   granny.dll     0x10100000  -"
-    "mss32    mss32.dll      -           -"
-    "mp3dec   mp3dec.asi     -           -"
+    "aomx     aomx.exe       -           $build/survey/aomx.functions.csv  0x4cd815"
+    "msvcrt   msvcrt.dll     -           -  -"
+    "msvcp60  msvcp60.dll    -           -  -"
+    "rockall  rockalldll.dll -           -  -"
+    "granny   granny.dll     0x10100000  -  -"
+    "mss32    mss32.dll      -           -  -"
+    "mp3dec   mp3dec.asi     -           -  -"
+    "msxml4   $build/extracted/msxml4.dll  -  $build/survey/msxml4.functions.csv  -"
 )
+
+# MSXML 4.0 is not in the game folder: the installer carries it in msxmlenu.msi.
+# Its resource strings are in msxml4r.dll, from the same cabinet.
+if [ ! -f "$build/extracted/msxml4.dll" ] || [ ! -f "$build/extracted/msxml4r.dll" ]; then
+    command -v 7z >/dev/null || { echo "7z is needed to extract msxml4.dll from msxmlenu.msi" >&2; exit 2; }
+    tmp="$build/extracted/msi"
+    rm -rf "$tmp" && mkdir -p "$tmp"
+    7z x -y -o"$tmp" "$orig/msxmlenu.msi" >/dev/null
+    cab=$(grep -l "MSCF" "$tmp"/* 2>/dev/null | head -1)
+    7z x -y -o"$tmp/cab" "$cab" >/dev/null
+    cp "$tmp"/cab/msxml4.dll.* "$build/extracted/msxml4.dll"
+    cp "$tmp"/cab/msxml4r.dll.* "$build/extracted/msxml4r.dll"
+    rm -rf "$tmp"
+fi
 
 case "$target" in
 host) cc="${CC:-gcc}" ;;
@@ -67,12 +83,21 @@ else
     sdl_libs="-lSDL2"
 fi
 
+# FreeType renders the fonts GDI hands out (gdi.c); EGL and OpenGL ES 3 draw Direct3D (d3d8gl.c).
+if [ "$target" = host ]; then
+    ft_cflags="$(pkg-config --cflags freetype2)"
+    ft_libs="$(pkg-config --libs freetype2) $(pkg-config --libs egl glesv2)"
+else
+    ft_cflags="-I$("$cc" -print-sysroot)/usr/include/freetype2"
+    ft_libs="-lfreetype -lEGL -lGLESv2"
+fi
+
 # ---- 1. lift each image (redone when the lifter or its inputs change)
 mkdir -p "$gen" "$out/obj"
 pids=()
 for line in "${modules[@]}"; do
-    read -r mod file rebase csv <<<"$line"
-    pe="$orig/$file"
+    read -r mod file rebase csv hooks <<<"$line"
+    case "$file" in /*) pe="$file" ;; *) pe="$orig/$file" ;; esac
     [ -f "$pe" ] || { echo "not found: $pe (set ORIG)" >&2; exit 2; }
     [ "$csv" = - ] || [ -f "$csv" ] || csv=-
     dir="$gen/$mod"
@@ -80,7 +105,7 @@ for line in "${modules[@]}"; do
     need=$relift
     [ -f "$stamp" ] || need=1
     if [ "$need" = 0 ]; then
-        for f in "$here"/lift/*.py "$pe" ${csv#-}; do
+        for f in "$here"/lift/*.py "$here/build.sh" "$pe" ${csv#-}; do
             [ "$f" -nt "$stamp" ] && need=1
         done
     fi
@@ -89,6 +114,7 @@ for line in "${modules[@]}"; do
     args=(--pe "$pe" --module "$mod" --out "$dir")
     [ "$rebase" = - ] || args+=(--rebase "$rebase")
     [ "$csv" = - ] || args+=(--csv "$csv")
+    [ "$hooks" = - ] || args+=(--hook "$hooks")
     echo "== lifting $file"
     # shellcheck disable=SC2086
     (python3 "$here/lift/lift.py" "${args[@]}" ${LIFT_FLAGS:-} >"$dir/lift.log" 2>&1 && touch "$stamp") &
@@ -114,7 +140,7 @@ cflags_common="-std=gnu11 -pthread -fno-strict-aliasing -fwrapv -fno-stack-prote
 {
     echo "cc = $cc"
     echo "gen_cflags = $opt -foptimize-sibling-calls $cflags_common -w"
-    echo "rt_cflags = -O2 -g $cflags_common $sdl_cflags -Wall -Wextra -Wno-unused-parameter"
+    echo "rt_cflags = -O2 -g $cflags_common $sdl_cflags $ft_cflags -Wall -Wextra -Wno-unused-parameter"
     echo "rule gen"
     echo "  command = \$cc \$gen_cflags \$inc -c \$in -o \$out"
     echo "  description = CC \$out"
@@ -123,16 +149,17 @@ cflags_common="-std=gnu11 -pthread -fno-strict-aliasing -fwrapv -fno-stack-prote
     echo "  depfile = \$out.d"
     echo "  description = CC \$out"
     echo "rule link"
-    echo "  command = \$cc -o \$out \$in -lm -pthread $sdl_libs"
+    echo "  command = \$cc -o \$out \$in -lm -pthread $sdl_libs $ft_libs"
     echo "  description = LINK \$out"
     objs=""
     for line in "${modules[@]}"; do
         read -r mod _ <<<"$line"
         for src in "$gen/$mod"/chunk_*.c "$gen/$mod/tables.c"; do
             o="obj/$mod/$(basename "${src%.c}").o"
-            # the lifted code is written against cpu.h alone; only tables.c sees rt.h
-            deps="$here/runtime/cpu.h $gen/$mod/funcs.h"
-            [ "$(basename "$src")" = tables.c ] && deps="$deps $here/runtime/rt.h"
+            # the lifted code is written against cpu.h alone (each chunk declares the
+            # functions it calls); only tables.c sees rt.h and funcs.h
+            deps="$here/runtime/cpu.h"
+            [ "$(basename "$src")" = tables.c ] && deps="$deps $here/runtime/rt.h $gen/$mod/funcs.h"
             echo "build $o: gen $src | $deps"
             echo "  inc = -I$gen/$mod"
             objs="$objs $o"
@@ -152,4 +179,6 @@ cflags_common="-std=gnu11 -pthread -fno-strict-aliasing -fwrapv -fno-stack-prote
 echo "== compiling for $target with $cc ($opt, -j$jobs)"
 t0=$(date +%s)
 ninja -C "$out" -j "$jobs"
+# System DLLs the program lifts are loaded from its own directory.
+cp -p "$build/extracted/msxml4.dll" "$build/extracted/msxml4r.dll" "$out/"
 echo "== build took $(( $(date +%s) - t0 ))s -> $out/aom"
