@@ -75,6 +75,9 @@ extern uint8_t *g_mem;
 static inline uint8_t ld8(uint32_t a) { return *G(a); }
 static inline uint16_t ld16(uint32_t a) { uint16_t v; memcpy(&v, G(a), 2); return v; }
 static inline uint32_t ld32(uint32_t a) { uint32_t v; memcpy(&v, G(a), 4); return v; }
+/* A 48-bit far pointer (16-bit selector : 32-bit offset). In the flat 32-bit
+ * model only the offset is used; the selector (at a+4) is ignored. */
+static inline uint32_t ld48(uint32_t a) { return ld32(a); }
 static inline uint64_t ld64(uint32_t a) { uint64_t v; memcpy(&v, G(a), 8); return v; }
 static inline void st8(uint32_t a, uint8_t v) { *G(a) = v; }
 static inline void st16(uint32_t a, uint16_t v) { memcpy(G(a), &v, 2); }
