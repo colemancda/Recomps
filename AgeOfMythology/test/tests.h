@@ -61,7 +61,7 @@ enum { SH_LOGICAL, SH_ARITH, SH_ROT, SH_RC };
     T(t_lahf_sahf, K_CUSTOM, 0, 0) \
     T(t_rep_movsb, K_CUSTOM, 0, 0) T(t_rep_movsd, K_CUSTOM, 0, 0) T(t_rep_stos, K_CUSTOM, 0, 0) \
     T(t_strlen, K_CUSTOM, 0, 0) T(t_scas_bounded, K_CUSTOM, 0, 0) T(t_memcmp, K_CUSTOM, 0, 0) \
-    T(t_extend, K_PAIR, 0, 0) T(t_bits, K_CUSTOM, 0, 0) T(t_xadd_cmpxchg, K_CUSTOM, 0, 0) T(t_lock_ops, K_CUSTOM, 0, 0) T(t_seg_pushpop, K_CUSTOM, 0, 0) \
+    T(t_extend, K_PAIR, 0, 0) T(t_bits, K_CUSTOM, 0, 0) T(t_xadd_cmpxchg, K_CUSTOM, 0, 0) T(t_lock_ops, K_CUSTOM, 0, 0) T(t_seg_pushpop, K_CUSTOM, 0, 0) T(t_xlat, K_CUSTOM, 0, 0) \
     T(t_wide_arith, K_CUSTOM, 0, 0) T(t_stack, K_PAIR, 0, 0) T(t_calls, K_PAIR, 0, 0) \
     T(t_nonlocal, K_CUSTOM, 0, 0) T(t_switch3, K_PAIR, 0, 0) \
     T(t_switch, K_CUSTOM, 0, 0) T(t_switch2, K_CUSTOM, 0, 0) T(t_loops, K_CUSTOM, 0, 0) \
@@ -357,6 +357,10 @@ static void custom(int ix) {
         break;
     case IX_t_seg_pushpop:
         for (u32 i = 0; i < NVALS; i++) one(ix, VALS[i], 0, 0, 0, 0);
+        break;
+    case IX_t_xlat:
+        for (u32 i = 0; i < NVALS; i++)
+            for (u32 j = 0; j < NVALS; j++) one(ix, VALS[i], VALS[j], 0, 0, 0);
         break;
     case IX_t_lock_ops:
         for (u32 i = 0; i < NVALS; i++)
