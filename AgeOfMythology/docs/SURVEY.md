@@ -394,5 +394,275 @@ together with no symbol clashes:
   was made under Wine with SSE reported, so replaying it on the x87 paths is
   itself the check. MMX and SSE1 translation (plan step 1) is therefore
   deferred until a trap shows one is reached.
-- **Not done yet:** the runtime's dispatch, loader and `main` still handle
-  one image (step 2).
+- **Runtime side:** dispatch, the loader and `main` handle all images (see
+  the next section).
+
+## Booting the recompilation (step 2, in progress)
+
+`./build.sh` lifts the seven images plus `msxml4.dll`, compiles and links
+`build/host/aom`; `build/run/go.sh` runs it headless with the game files read
+from `orig/` and every write going to `build/run/`.
+
+What runs so far, in order:
+
+- **Loading.** All images map at their bases; Granny's 10,226 relocations are
+  applied; imports between lifted images are linked directly. DllMain runs for
+  msvcrt, msvcp60, Rockall, Granny and Miles (each after the DLLs it imports),
+  then `aomx.exe`'s CRT start-up and its static constructors.
+- **MSLU.** `_GetProcAddressInternal` (0x4cd815) walks a DLL's export
+  directory by hand; it is replaced by a host hook (`lift.py --hook`,
+  `rt_hooks[]` in `runtime/aom.c`) that answers from the import handlers.
+  MSLU decides between NT and Windows 9x by `GetFileAttributesW("???.???")`
+  failing with `ERROR_INVALID_NAME`; it does now, so it calls the W functions
+  directly.
+- **Start-up checks the game makes**, and what satisfies them:
+  - `shfolder.dll` must load (`SHGetFolderPathW` finds My Documents, mapped
+    to `C:\Documents and Settings\Player\My Documents` under
+    `build/run/drive_c`).
+  - DirectX 8.1 is detected as in the DirectX SDK's `GetDXVersion`:
+    `dpnhpast.dll` (the DirectPlay NAT helper) must load.
+  - The language strings come from `xpackLanguage.dll` and `language.dll`,
+    resource-only DLLs mapped as data (`LoadStringW` on their handles).
+  - The licence stub (`EBUEula`) is called once and accepts.
+  - The main window is created and `Direct3DCreate8` is called.
+- **MSXML 4.0.** The game reads its XML data through MSXML 4's COM DOM
+  (`CoCreateInstance`). The installer carries MSXML 4.0 in
+  `orig/msxmlenu.msi`; `build.sh` extracts `msxml4.dll` from it into
+  `build/extracted/` and lifts it like the game's DLLs, and the runtime's
+  `CoCreateInstance` asks the lifted DLL's `DllGetClassObject`. Its imports:
+  ole32 (9), shlwapi (29, a dozen by ordinal, mapped with Wine's
+  `shlwapi.spec`) and kernel32.
+  - msxml4 has no `.rdata`: its vtables are in `.text`, so the lifter now
+    also takes relocated words inside code sections as pointers. With
+    Ghidra's function list (5962 functions) as seeds.
+
+Runtime pieces added for this: per-module function lookup (a two-level page
+table), the multi-image loader, a null Direct3D 8 device (`d3d8.c`), GDI with
+FreeType fonts (`gdi.c`, Liberation fonts standing in for Arial and Times New
+Roman), W forms of the user32, kernel32 and registry functions, semaphores,
+directory enumeration, per-module resources, display modes, and the AoM
+registry defaults (the installer creates only an empty key).
+
+### Where it stands
+
+The game now runs its frame loop headless: `build/host/aom --headless --exe
+orig/aomx.exe --savedir build/run --frames 600 -- +noIntroCinematics` presents
+600 frames and exits cleanly (about 35 frames a second on the null device).
+
+- **Display.** Without a player profile the game picks 1024x768 at 16 bits.
+  A steady frame is about 1,170 draws (780 `DrawIndexedPrimitive`, 386
+  `DrawPrimitive`) with transforms, materials and lights: a 3D scene, not
+  the 35-draw 2D menu seen under Wine at 640x480. What it is will be visible
+  once step 3 draws it.
+- **Sound** is reported as unavailable (`DirectSoundEnumerateW` and
+  DirectSound 8 are not provided yet); the game says so in a dialog and
+  carries on.
+- **Dialogs** cannot be shown: `DialogBoxIndirectParamW` logs the template's
+  title and texts and answers IDOK. The game's error dialogs were how the
+  font search bug and the sound state were found.
+- **A guest path to check:** the game opens
+  `\C:\Program Files\...\users\Default.prf` (a leading backslash before the
+  drive), which fails. Probably a path built from a value it expects in a
+  different form.
+
+Runtime bugs found on the way:
+
+- **Heap size classes.** A request of 2041-2048 bytes made a 2064-byte "small"
+  block whose bin (128) was also the first large bin, so a freed one was later
+  handed out as a 2560-byte block and overrun. A 32x32 16-bit texture is
+  exactly 2048 bytes. Fixed in `runtime/mem.c`; the same code is in
+  `GunBound/runtime/mem.c`. `RECOMP_HEAP_DEBUG=1` fills freed blocks and
+  checks them on reuse, and reports who freed a block that was written
+  after free.
+- **Directory search in the overlay.** When a folder exists in the write
+  overlay (the game creates empty `Fonts` there), the game-tree side of the
+  search was joined verbatim (`orig/Fonts`) instead of matched without regard
+  to case (`orig/fonts`), so `fonts\xfonts.xml` was "not found" and the game
+  reported an XML error.
+- **Lifter coverage.** A vtable slot (`0x720070`) shaped like UTF-16 text was
+  rejected; data words beside other code pointers now count as vtable entries.
+
+## Direct3D 8 on OpenGL ES 3 (step 3, first version)
+
+`runtime/d3d8gl.c` draws for the device in `runtime/d3d8.c` (shared state in
+`runtime/d3d8.h`):
+
+- **Context.** EGL, Mesa's surfaceless platform first (no window system
+  needed, so headless runs draw too), the default display otherwise. The game
+  draws into a framebuffer object; Present reads it back as RGB565 for
+  `video.c`, so the window, `--dump-frame` and `--frames` work unchanged.
+  With a window, SDL must not hold a GL context on the same thread
+  (libglvnd refuses an EGL and a GLX context current together): the window
+  uses SDL's software renderer with `SDL_HINT_FRAMEBUFFER_ACCELERATION` off.
+- **Fixed function.** One generated GLSL ES program per state combination
+  (vertex format, lighting and lights, material sources, texture stage
+  operations and arguments, texture coordinate generation and transforms,
+  fog, alpha test); uniforms carry matrices, lights, material, fog, texture
+  factor. Vertex input comes from FVF codes or from the declarations of
+  `CreateVertexShader`; vertices are copied from guest memory per draw.
+- **Textures** are converted to RGBA8 (DXT1-5 decoded in software) when first
+  used after a change.
+- **Culling.** D3D's and GL's windings agree here: D3DCULL_CCW culls GL's
+  front (counter-clockwise) faces. Getting this backwards hid the terrain and
+  the whole interface.
+- **Debugging:** `RECOMP_D3D_LOG=N` describes every draw of frame N;
+  `RECOMP_D3D_NODEPTH`, `RECOMP_D3D_NOCULL` switch those tests off;
+  `RECOMP_NO_GL` keeps the null device.
+
+Result: the main menu (with its 3D background), the Single Player menus and
+a random-map game render, and mouse and keyboard input work in a window.
+
+Fixed on the way:
+
+- **Window and display mode.** A full-screen device now sets user32's display
+  mode and resizes its window with WM_MOVE/WM_SIZE, as Windows does;
+  `video.c` maps the mouse to the size of the presented frames.
+- **Paths like `\\C:\dir`** (left by MSXML's URL-to-path conversion) are
+  resolved as `C:\dir`; the random map descriptions and `Default.prf` load.
+- **Lifter:** a relocated word is treated as a pointer even where the same
+  value is also an instruction immediate (an msxml4 callback was missed).
+- **`xlatb`** is translated (msvcrt's `_CIatan2`), with a test snippet.
+
+Open:
+
+- Render targets other than the back buffer are skipped (logged once).
+- Text uses the serif Liberation face where Wine showed Arial-like sans: the
+  typeface the game asks for needs checking.
+
+## Cursor and sound
+
+- **1024x768.** The earlier report of dead controls at 1024x768 no longer
+  reproduces: headless (scripted input) and through the X window (XTEST
+  clicks on the scaled 640x480 window), Single Player, Random Map, Hard and
+  START all work and the game starts. It was fixed by the guest screen
+  following the presented frame size.
+- **Cursor.** The game never calls `SetCursorProperties`: it uses Windows
+  cursors, `LoadCursorW(hInstance, id)` from aomx.exe's resources (35 shapes)
+  and `SetCursor` every frame. `LoadCursor` now decodes the `RT_GROUP_CURSOR`
+  / `RT_CURSOR` resources (1, 4, 8, 24 and 32-bit DIBs with their AND mask) to
+  ARGB, and the video layer makes SDL colour cursors of them; stock `IDC_*`
+  cursors map to SDL system cursors and `SetCursor(NULL)` hides the pointer.
+  The window shows the pointer in full screen too (GunBound drew its own).
+  Checked with XFixes: the X server shows the game's bronze arrow.
+- **Sound.** Miles (mss32) enumerates devices with `DirectSoundEnumerateW`
+  before creating one; with that added it uses the runtime's DirectSound
+  mixer. Buffers answer `QueryInterface` for `IDirectSoundBuffer8`. aomx.exe
+  reads WAV files through winmm's mmio functions, now provided (files and
+  `FOURCC_MEM` buffers, RIFF descend/ascend). The menu music (MP3, decoded
+  by the lifted mp3dec) and UI clicks play; in a skirmish the start fanfare
+  and unit sounds mix in (`--dump-audio`).
+
+
+## Replaying the reference recording (step 5, started)
+
+- **Fonts.** The menus ask for `Georgia` and `GiovanniITCTT` (serif) as well as
+  `Arial` / `Arial Unicode MS`. The reference Wine prefix has no fonts at all,
+  so Wine drew everything with its sans fallback; the serif text here is what
+  the game asks for, not a mapping error.
+- **Render targets.** Menus and a skirmish never call `SetRenderTarget`.
+- **Loading `rec1`.** Single Player > Recorded Games lists the `.rcx` files in
+  `Savegame` (the reference recording copied there as `rec1.rcx`).
+- **`wsprintfW`** (through MSLU) builds `<savegame>\rec1-*.rbm`. It was
+  missing, and adding it exposed a calling-convention bug: functions handed out
+  through `rt_host_fn` (MSLU's lookups, `GetProcAddress`) were always
+  stdcall, so the cdecl `wsprintfW` popped its two arguments and the caller
+  popped them again. The game then read its buffer 8 bytes late (the find
+  pattern lost `C:\D`) and later returned into the heap. `rt_host_fn` now takes
+  the convention from the import table, and `GetProcAddress` no longer refuses
+  cdecl functions.
+- **Running.** The replay loads the same desert map and starting town as
+  under Wine and runs without a fault; at normal speed the progress bar is
+  about a third along after 10 minutes.
+- **First full replay.** With Play Fast it runs to the end (headless, about
+  25,000 presented frames): the Hard AI's army raids the town and kills every
+  villager, the player resigns, and the game shows "You have been defeated"
+  and "Record Game Ended" with the Town Center standing, as under Wine.
+- **Postgame statistics match Wine exactly.** After the replay ends, F10 >
+  View Postgame shows the statistics the simulation accumulated. The same
+  replay under Wine (640x480, Play Fast) and under the recompilation
+  (headless, 1024x768) give identical tables on every tab:
+  - Score: Default 356 (economy 250, military 91, improvements 0,
+    mythology 15); Megara 1565 (918, 277, 309, 61).
+  - Economy: Default food 250, wood 255, gold 100, favor 15, civilian high 3;
+    Megara 5621, 5966, 2875, favor 56, civilian high 56.
+  - Military: Default 1 military, 9 killed, 0 razed, 4 lost, 1 building
+    lost; Megara 34, 4, 1, 9, 1.
+  - Improvements: Megara reached the Classical Age at 00:04:59, 12
+    researches. Mythology: one settlement each, favourite soldiers
+    Kataskopos (1) and Medium Toxotes (22), Megara's myth unit Centaur (1).
+  - Timeline: the same population curves over the 14 minutes.
+  The Hard AI's whole game (gathering, research, army, attack) is
+  reproduced: the AI's decisions, pathing, combat and random numbers come out
+  the same as on Windows-under-Wine for this recording.
+- **Sync log.** `+alwaysLogSync` makes the game open `RTS3synclog.txt` when the
+  sync manager is torn down (leaving the game, not `--frames`), but a retail
+  build writes only the header unless it detects an out-of-sync. The
+  postgame tables are the comparison used instead.
+- **Navigation for these runs.** Recomp (1024x768, `--input`): Single Player
+  505,422; Recorded Games 505,542; first file 290,265; Open 444,534; Play
+  Fast 297,691 (after loading); F10 is `key 79 44`; View Postgame 512,313;
+  tabs at y=38, x = 126, 280, 434, 589, 741, 896. Headless with Play Fast the
+  replay ends before frame 28000. Wine (640x480 at the desktop's top-left):
+  the same positions scaled by 0.625, F10 through `tools/xinput.py key F10`.
+
+## Cross-architecture comparison (step 5)
+
+- **Draw-stream hash.** `RECOMP_D3D_HASH=1` logs, at every Present, an FNV-1a
+  hash of what the frame asked Direct3D to draw: primitive types and counts and
+  the vertex and index bytes used (`d3d8.c`). It does not depend on the
+  backend: x86 with OpenGL ES and x86 with the null device (`RECOMP_NO_GL=1`)
+  give the same hashes. So the aarch64 build can be checked under
+  `qemu-aarch64`, where there is no GPU and the sysroot has no software GL.
+- **aarch64 build.** `./build.sh aarch64` (batocera h616 toolchain) builds
+  cleanly. Under `qemu-aarch64 -L <sysroot>` with the null device it boots to
+  the main menu in under two minutes and plays the menu music (the mixed peak
+  matches the x86 run's).
+- **Virtual clock.** `--virtual-clock` (from GunBound) makes guest time advance
+  with the main thread's work. Boot, main menu, Single Player and the Recorded
+  Games dialog (560 frames) give the same hashes on x86 (twice, with and
+  without GL) and on aarch64.
+- **Sound makes runs unrepeatable.** With sound on, two x86 virtual-clock runs
+  of the replay diverge at frame 618 (just after loading starts), keep the same
+  draw counts, re-converge now and then and end on the same static postgame
+  screen: the content is the same, the timing is not. Miles' service thread
+  (`CreateThread` + `Sleep`) and the runtime's headless mixer thread run on
+  real time, and what the main thread finds when it calls into Miles changes
+  how many clock reads a frame takes. With `--no-sound` two x86 runs agree on
+  all 4000 frames compared. Comparisons use `--no-sound`; the simulation does
+  not depend on sound.
+- **The whole replay matches across architectures.** The reference recording,
+  replayed with `--virtual-clock --no-sound` to frame 30000 (the game ends and
+  "Record Game Ended" shows before frame 30000), gives the same draw-stream
+  hash on every one of the 30000 frames on x86_64 with OpenGL ES, x86_64 with
+  the null device and aarch64 under qemu with the null device. The aarch64 run
+  took 45 minutes. With the postgame tables matching Wine, the 14-minute game
+  is reproduced on Windows (Wine), x86_64 Linux and aarch64 Linux.
+  `test/replay_hash.sh RECORDING` runs this check; `tools/replay_check.sh`
+  captures the postgame tables (real time, with sound) for a by-eye check
+  against Wine.
+
+## Second reference recording
+
+- **`build/recordings/rec2-moderate-1v1.rcx`** (SHA-1
+  `998b202c9e462a8eaf09101cf220efff44ae00b8`, 27329 bytes, 359719
+  uncompressed). Recorded under Wine: 1v1 random map (a green map), Zeus against
+  a Moderate AI that rolled the Norse (Halogaland). The player queued villagers
+  every three minutes and sent them to wood; the AI used the Great Hunt god
+  power at once, reached the Classical Age at 4:43 and the Heroic Age at 14:50,
+  traded (142 gold from caravans), trained 16 Medium Throwing Axemen and a
+  Frost Giant, and burned the player's Town Center at about 16 minutes. The
+  file is written at the defeat.
+- **The live game's postgame tables** were captured under Wine before quitting
+  (`build/recordings/rec2-postgame-wine/`): Score 507 / 1901; Economy food
+  250 / 5918, wood 1024 / 6150, gold 100 / 3993, gold from trade 0 / 142,
+  favor 15 / 45, civilian high 8 / 30; Military 1 / 39 units, 23 / 9 killed,
+  0 / 3 buildings razed, 9 / 23 lost, 2 / 0 buildings lost; research 0 / 15.
+- **Replayed by the recompilation** (`tools/replay_check.sh`, real time, with
+  sound, FRAMES=36000), every table equals the live game's. That run's tabs
+  are the reference set `build/recordings/rec2-postgame/` for later
+  `tools/replay_check.sh ... build/recordings/rec2-postgame` runs.
+- **Across architectures.** `test/replay_hash.sh rec2-moderate-1v1.rcx 36000`
+  passes: all 36000 frames have identical draw streams on x86_64 and aarch64
+  (qemu). An x86 run with OpenGL ES gives the same hashes and its frame 36000
+  is the end of the game: "You have been defeated", "Record Game Ended", the
+  Town Center burned down to a Settlement, as in the live game under Wine.
