@@ -71,8 +71,10 @@
 #define GWL_USERDATA (-21)
 #define PM_REMOVE 1
 
-#define SCREEN_W 800
-#define SCREEN_H 600
+/* The guest's screen: the display mode the game sets with ChangeDisplaySettings. */
+static int screen_w = 640, screen_h = 480, screen_bpp = 16;
+#define SCREEN_W screen_w
+#define SCREEN_H screen_h
 #define HWND_BASE 0x00010100u
 #define HDC_FAKE 0x0000DC00u
 
@@ -130,7 +132,7 @@ static Timer timers[64];
 static uint32_t next_timer_id = 0x7F00;
 static uint32_t main_hwnd, focus_hwnd, active_hwnd;
 static int cursor_count;
-static uint32_t current_cursor = 0x00010003u;
+static uint32_t current_cursor = 0x00010000u | 12u; /* IDC_ARROW */
 static uint32_t def_proc_addr, edit_proc_addr, static_proc_addr;
 
 static uint32_t now_ms(void) { return (uint32_t)(rt_mono_ns() / 1000000ull); }
@@ -1016,15 +1018,121 @@ H(user_PostQuitMessage) {
 }
 
 /* ------------------------------------------------------- cursor and keys */
+/* Cursor handles: 0x0001xxxx a stock cursor (IDC_* - 32500), 0x0002xxxx a cursor
+ * made from a module's resources (the video cursor id). */
+#define STOCK_CURSOR(idc) (0x00010000u | ((idc) - 32500u))
+static const struct { uint16_t idc; uint8_t sdl; } stock_cursors[] = {
+    /* IDC_* -> SDL_SystemCursor */
+    {32512, 0}, {32513, 1}, {32514, 2}, {32515, 3}, {32516, 0}, {32640, 9}, {32641, 0}, {32642, 5},
+    {32643, 6}, {32644, 7}, {32645, 8}, {32646, 9}, {32648, 10}, {32649, 11}, {32650, 4}, {32651, 0},
+};
+
+/* A cursor from a module's RT_GROUP_CURSOR (12): the entry nearest 32x32 with the
+ * most colours. Its RT_CURSOR (1) is the hot spot (two WORDs) and a DIB: a
+ * BITMAPINFOHEADER of twice the height, the colour (XOR) bitmap bottom-up, then the
+ * 1-bit AND mask. Returns the video cursor id, -1 if there is none. */
+static int cursor_from_resource(uint32_t hmod, uint32_t id) {
+    uint32_t gsz = 0, g = rt_resource(hmod, 12, id, &gsz);
+    if (!g || gsz < 6) return -1;
+    uint32_t n = ld16(g + 4), pick = 0;
+    int best = -1;
+    for (uint32_t i = 0; i < n && 6 + 14 * (i + 1) <= gsz; i++) {
+        uint32_t e = g + 6 + 14 * i;
+        int w = ld16(e), bpp = ld16(e + 6);
+        int score = (w == 32 ? 1000 : 500 - abs(w - 32)) + bpp;
+        if (score > best) best = score, pick = ld16(e + 12);
+    }
+    uint32_t sz = 0, d = best >= 0 ? rt_resource(hmod, 1, pick, &sz) : 0;
+    if (!d || sz < 4 + 40) return -1;
+    int hx = ld16(d), hy = ld16(d + 2);
+    uint32_t bi = d + 4, hdr = ld32(bi);
+    int w = (int32_t)ld32(bi + 4), h = (int32_t)ld32(bi + 8) / 2, bpp = ld16(bi + 14);
+    uint32_t comp = ld32(bi + 16), used = ld32(bi + 32);
+    if (w <= 0 || h <= 0 || w > 256 || h > 256 || (comp != 0 && !(comp == 3 && bpp == 32))) return -1;
+    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32) return -1;
+    uint32_t ncolors = bpp <= 8 ? (used ? used : 1u << bpp) : 0;
+    uint32_t pal = bi + hdr + (comp == 3 ? 12 : 0);
+    uint32_t xor_bits = pal + 4 * ncolors, xor_stride = (uint32_t)((w * bpp + 31) / 32) * 4;
+    uint32_t and_bits = xor_bits + xor_stride * (uint32_t)h, and_stride = (uint32_t)((w + 31) / 32) * 4;
+    if (and_bits + and_stride * (uint32_t)h > d + sz) return -1;
+    uint32_t *px = malloc((size_t)w * (size_t)h * 4);
+    if (!px) return -1;
+    int has_alpha = 0;
+    for (int y = 0; y < h; y++) {
+        uint32_t row = xor_bits + xor_stride * (uint32_t)(h - 1 - y), mrow = and_bits + and_stride * (uint32_t)(h - 1 - y);
+        for (int x = 0; x < w; x++) {
+            uint32_t rgb;
+            switch (bpp) {
+            case 1: rgb = ld32(pal + 4 * ((ld8(row + (uint32_t)x / 8) >> (7 - x % 8)) & 1)); break;
+            case 4: rgb = ld32(pal + 4 * ((ld8(row + (uint32_t)x / 2) >> (x % 2 ? 0 : 4)) & 15)); break;
+            case 8: rgb = ld32(pal + 4 * ld8(row + (uint32_t)x)); break;
+            case 24: rgb = ld8(row + 3u * (uint32_t)x) | ld8(row + 3u * (uint32_t)x + 1) << 8 | ld8(row + 3u * (uint32_t)x + 2) << 16; break;
+            default: rgb = ld32(row + 4u * (uint32_t)x); break;
+            }
+            if (bpp == 32 && (rgb >> 24)) has_alpha = 1;
+            int masked = (ld8(mrow + (uint32_t)x / 8) >> (7 - x % 8)) & 1;
+            /* AND 1 with colour 0 is transparent; with a colour it inverts the screen,
+             * shown here as opaque black. */
+            uint32_t v = masked ? ((rgb & 0xFFFFFF) ? 0xFF000000u : 0) : (0xFF000000u | (rgb & 0xFFFFFF));
+            px[y * w + x] = v;
+        }
+    }
+    if (bpp == 32 && has_alpha) { /* the alpha channel decides, not the mask */
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) px[y * w + x] = ld32(xor_bits + xor_stride * (uint32_t)(h - 1 - y) + 4u * (uint32_t)x);
+    }
+    int vid = rt_video_cursor_create(px, w, h, hx, hy);
+    free(px);
+    return vid;
+}
+
+static struct { uint32_t hmod, id; int vid; } res_cursors[256];
+static int nres_cursors;
+
+static uint32_t load_cursor(uint32_t hmod, uint32_t name) {
+    if (name >= 0x10000) return STOCK_CURSOR(32512); /* by name: not used by the game */
+    if (hmod == 0) {
+        for (size_t i = 0; i < RT_COUNTOF(stock_cursors); i++)
+            if (stock_cursors[i].idc == name) return STOCK_CURSOR(name);
+        return 0;
+    }
+    pthread_mutex_lock(&user_mu);
+    int vid = -1, found = 0;
+    for (int i = 0; i < nres_cursors && !found; i++)
+        if (res_cursors[i].hmod == hmod && res_cursors[i].id == name) vid = res_cursors[i].vid, found = 1;
+    pthread_mutex_unlock(&user_mu);
+    if (!found) {
+        vid = cursor_from_resource(hmod, name);
+        if (g_opt.verbose) rt_log("[user] cursor #%u of %#x -> %d\n", name, hmod, vid);
+        pthread_mutex_lock(&user_mu);
+        if (nres_cursors < (int)RT_COUNTOF(res_cursors)) res_cursors[nres_cursors++] = (typeof(res_cursors[0])){hmod, name, vid};
+        pthread_mutex_unlock(&user_mu);
+    }
+    return vid >= 0 ? 0x00020000u | (uint32_t)vid : STOCK_CURSOR(32512);
+}
+
 H(user_LoadCursorA) {
     UNUSED;
-    if (a[0] == 0 && a[1] < 0x10000) return 0x00010000u | (a[1] & 0xFF) | 1u; /* a stock cursor */
-    return 0x00010001u;
+    return load_cursor(a[0], a[1]);
+}
+
+static void show_cursor_handle(uint32_t h) {
+    if ((h & 0xFFFF0000u) == 0x00020000u) {
+        rt_video_set_cursor((int)(h & 0xFFFF));
+    } else if ((h & 0xFFFF0000u) == 0x00010000u) {
+        uint32_t idc = (h & 0xFFFF) + 32500u;
+        for (size_t i = 0; i < RT_COUNTOF(stock_cursors); i++)
+            if (stock_cursors[i].idc == idc) rt_video_set_cursor(RT_CURSOR_SYSTEM + stock_cursors[i].sdl);
+    } else if (h == 0) {
+        rt_video_set_cursor(RT_CURSOR_NONE);
+    }
 }
 
 H(user_SetCursor) {
     UNUSED;
-    return __atomic_exchange_n(&current_cursor, a[0], __ATOMIC_SEQ_CST);
+    uint32_t old = __atomic_exchange_n(&current_cursor, a[0], __ATOMIC_SEQ_CST);
+    if (old != a[0]) show_cursor_handle(a[0]);
+    return old;
 }
 
 H(user_ShowCursor) {
@@ -1056,6 +1164,7 @@ H(user_MessageBoxA) {
     fflush(stdout);
     rt_log("\nrecomp: MessageBoxA from thread %x (type %#x)\n  caption: %s\n  text:    %s\n", c->thread_id, a[3],
            a[2] ? rt_gstr(a[2]) : "(default: Error)", a[1] ? rt_gstr(a[1]) : "");
+    if (g_opt.verbose) rt_backtrace(c);
     rt_video_message_box(a[2] ? rt_gstr(a[2]) : "Error", a[1] ? rt_gstr(a[1]) : "");
     switch (a[3] & 0xF) {
     case 4: return 6; /* MB_YESNO: IDYES */
@@ -1067,7 +1176,8 @@ H(user_MessageBoxA) {
 /* -------------------------------------------------------------- wsprintf
  * int wsprintfA(char *out, const char *fmt, ...): cdecl, so the variable
  * arguments are read from the guest stack. */
-static uint32_t format_guest(char *out, size_t cap, const char *fmt, uint32_t argp) {
+/* wfmt: wsprintfW, where %s and %c are wide (%hs, %S narrow); text is UTF-8 here. */
+static uint32_t format_guest(char *out, size_t cap, const char *fmt, uint32_t argp, int wfmt) {
     size_t o = 0;
 #define PUT(ch) do { if (o + 1 < cap) out[o] = (char)(ch); o++; } while (0)
     while (*fmt) {
@@ -1085,9 +1195,10 @@ static uint32_t format_guest(char *out, size_t cap, const char *fmt, uint32_t ar
             spec[sn++] = *fmt++;
             while (isdigit((unsigned char)*fmt) && sn < 24) spec[sn++] = *fmt++;
         }
-        int wide = 0;
+        int wide = -1;
         while (*fmt == 'l' || *fmt == 'h' || *fmt == 'w' || *fmt == 'I') {
             if (*fmt == 'l' || *fmt == 'w') wide = 1;
+            else if (*fmt == 'h') wide = 0;
             fmt++;
         }
         char conv = *fmt ? *fmt++ : 0;
@@ -1099,11 +1210,15 @@ static uint32_t format_guest(char *out, size_t cap, const char *fmt, uint32_t ar
             snprintf(buf, sizeof buf, spec, ld32(argp));
             argp += 4;
             break;
-        case 'c': case 'C':
-            buf[0] = (char)ld32(argp);
-            buf[1] = 0;
+        case 'c': case 'C': {
+            int wch = wide == 1 || (wide < 0 && (conv == 'C') != wfmt);
+            uint32_t ch = ld32(argp) & (wch ? 0xFFFF : 0xFF);
             argp += 4;
+            if (ch < 0x80 || (!wch && !wfmt)) buf[0] = (char)ch, buf[1] = 0; /* a byte of the A text */
+            else if (ch < 0x800) buf[0] = (char)(0xC0 | ch >> 6), buf[1] = (char)(0x80 | (ch & 63)), buf[2] = 0;
+            else buf[0] = (char)(0xE0 | ch >> 12), buf[1] = (char)(0x80 | ((ch >> 6) & 63)), buf[2] = (char)(0x80 | (ch & 63)), buf[3] = 0;
             break;
+        }
         case 's': case 'S': {
             uint32_t p = ld32(argp);
             argp += 4;
@@ -1117,11 +1232,9 @@ static uint32_t format_guest(char *out, size_t cap, const char *fmt, uint32_t ar
             size_t n = 0;
             if (!p) {
                 n = (size_t)snprintf(tmp, sizeof tmp, "(null)");
-            } else if (wide || conv == 'S') {
-                while (n + 1 < sizeof tmp && ld16(p + 2 * (uint32_t)n)) {
-                    uint16_t wc = ld16(p + 2 * (uint32_t)n);
-                    tmp[n++] = wc < 0x100 ? (char)wc : '?';
-                }
+            } else if (wide == 1 || (wide < 0 && (conv == 'S') != wfmt)) {
+                n = rt_get_wstr(p, tmp, sizeof tmp);
+                if (n >= sizeof tmp) n = sizeof tmp - 1;
             } else {
                 while (n + 1 < sizeof tmp && ld8(p + (uint32_t)n)) {
                     tmp[n] = (char)ld8(p + (uint32_t)n);
@@ -1153,10 +1266,16 @@ static uint32_t format_guest(char *out, size_t cap, const char *fmt, uint32_t ar
 
 H(user_wsprintfA) {
     char out[1025]; /* wsprintf never writes more than 1024 characters */
-    uint32_t n = format_guest(out, sizeof out, rt_gstr(a[1]), ESP + 12);
+    uint32_t n = format_guest(out, sizeof out, rt_gstr(a[1]), ESP + 12, 0);
     if (n > 1024) n = 1024;
     memcpy(G(a[0]), out, n + 1);
     return n;
+}
+H(user_wsprintfW) {
+    char fmt[2048], out[4097];
+    rt_get_wstr(a[1], fmt, sizeof fmt);
+    format_guest(out, sizeof out, fmt, ESP + 12, 1);
+    return rt_put_wstr(a[0], 1025, out);
 }
 
 /* ------------------------------------------------------------ gdi32, imm32 */
@@ -1168,7 +1287,7 @@ H(gdi_GetDeviceCaps) {
     switch (a[1]) {
     case 8: return SCREEN_W;  /* HORZRES */
     case 10: return SCREEN_H; /* VERTRES */
-    case 12: return 16;       /* BITSPIXEL */
+    case 12: return (uint32_t)screen_bpp; /* BITSPIXEL */
     case 14: return 1;        /* PLANES */
     case 88: case 90: return 96; /* LOGPIXELSX/Y */
     case 116: return 60;      /* VREFRESH */
@@ -1184,8 +1303,544 @@ H(imm_ImmGetOpenStatus) { UNUSED; return 0; }
 H(imm_ImmGetCompositionStringA) { UNUSED; return 0; }
 H(imm_ImmSetCompositionWindow) { UNUSED; return 0; }
 
+/* ===================================================== Age of Mythology additions
+ * W forms, rectangles, window geometry, display modes, painting and other
+ * functions GunBound never called. */
+#define WM_GETMINMAXINFO 0x0024
+#define SM_CXSCREEN 0
+#define SM_CYSCREEN 1
+
+/* WNDCLASSEXA without cbSize is a WNDCLASSA. */
+H(user_RegisterClassExA) {
+    uint32_t args[1] = {a[0] + 4};
+    return user_RegisterClassA(c, args);
+}
+/* The W forms copy the structure with the strings converted. */
+static uint32_t register_w(CPU *c, uint32_t wc /* WNDCLASSW layout */) {
+    uint32_t tmp = rt_heap_alloc(40 + 256, 1);
+    memcpy(G(tmp), G(wc), 40);
+    uint32_t name = ld32(wc + 36);
+    if (name >= 0x10000) {
+        rt_get_wstr(name, (char *)G(tmp + 40), 256);
+        st32(tmp + 36, tmp + 40);
+    }
+    st32(tmp + 32, 0); /* menu name: no menus */
+    uint32_t args[1] = {tmp};
+    uint32_t r = user_RegisterClassA(c, args);
+    rt_heap_free(tmp);
+    return r;
+}
+H(user_RegisterClassW) { UNUSED; return register_w(c, a[0]); }
+H(user_RegisterClassExW) { UNUSED; return register_w(c, a[0] + 4); }
+H(user_UnregisterClass) { UNUSED; return 1; }
+H(user_CreateWindowExW) { return rt_call_a(c, a, 12, "user32.dll", "CreateWindowExA", (1u << 1) | (1u << 2)); }
+H(user_SetWindowTextW) { return rt_call_a(c, a, 2, "user32.dll", "SetWindowTextA", 2); }
+H(user_MessageBoxW) { return rt_call_a(c, a, 4, "user32.dll", "MessageBoxA", (1u << 1) | (1u << 2)); }
+H(user_GetWindowTextW) {
+    uint32_t tmp = rt_heap_alloc(1024, 1);
+    uint32_t args[3] = {a[0], tmp, 1024};
+    user_GetWindowTextA(c, args);
+    uint32_t n = a[2] ? rt_put_wstr(a[1], a[2], (const char *)G(tmp)) : 0;
+    rt_heap_free(tmp);
+    return n;
+}
+H(user_PostMessageA) {
+    UNUSED;
+    if (!a[0]) {
+        /* A thread message for the calling thread. */
+        pthread_mutex_lock(&user_mu);
+        QMsg m = {0, a[1], a[2], a[3], now_ms(), rt_mouse_x, rt_mouse_y, NULL};
+        queue_push(rt_thread_of(c), &m);
+        pthread_mutex_unlock(&user_mu);
+        return 1;
+    }
+    return (uint32_t)rt_post_message(a[0], a[1], a[2], a[3]);
+}
+H(user_LoadIcon) { UNUSED; return 0x00020001u; }
+H(user_LoadCursorW) { return user_LoadCursorA(c, a); }
+
+/* ------------------------------------------------------------- rectangles */
+static void rect_get(uint32_t r, int32_t v[4]) {
+    for (int i = 0; i < 4; i++) v[i] = (int32_t)ld32(r + 4 * (uint32_t)i);
+}
+static void rect_put(uint32_t r, const int32_t v[4]) {
+    for (int i = 0; i < 4; i++) st32(r + 4 * (uint32_t)i, (uint32_t)v[i]);
+}
+H(user_SetRect) {
+    UNUSED;
+    int32_t v[4] = {(int32_t)a[1], (int32_t)a[2], (int32_t)a[3], (int32_t)a[4]};
+    rect_put(a[0], v);
+    return 1;
+}
+H(user_SetRectEmpty) { UNUSED; memset(G(a[0]), 0, 16); return 1; }
+H(user_IsRectEmpty) {
+    UNUSED;
+    int32_t v[4];
+    rect_get(a[0], v);
+    return v[2] <= v[0] || v[3] <= v[1];
+}
+H(user_EqualRect) { UNUSED; return !memcmp(G(a[0]), G(a[1]), 16); }
+H(user_IntersectRect) {
+    UNUSED;
+    int32_t p[4], q[4], r[4];
+    rect_get(a[1], p);
+    rect_get(a[2], q);
+    r[0] = p[0] > q[0] ? p[0] : q[0];
+    r[1] = p[1] > q[1] ? p[1] : q[1];
+    r[2] = p[2] < q[2] ? p[2] : q[2];
+    r[3] = p[3] < q[3] ? p[3] : q[3];
+    if (r[2] <= r[0] || r[3] <= r[1]) {
+        memset(G(a[0]), 0, 16);
+        return 0;
+    }
+    rect_put(a[0], r);
+    return 1;
+}
+H(user_PtInRect) {
+    UNUSED;
+    int32_t v[4], x = (int32_t)a[1], y = (int32_t)a[2];
+    rect_get(a[0], v);
+    return x >= v[0] && x < v[2] && y >= v[1] && y < v[3];
+}
+H(user_OffsetRect) {
+    UNUSED;
+    int32_t v[4];
+    rect_get(a[0], v);
+    v[0] += (int32_t)a[1], v[2] += (int32_t)a[1], v[1] += (int32_t)a[2], v[3] += (int32_t)a[2];
+    rect_put(a[0], v);
+    return 1;
+}
+
+/* ------------------------------------------------------- window geometry */
+/* The main window always fills the guest screen, with no frame. */
+H(user_AdjustWindowRect) { UNUSED; return 1; }
+H(user_GetWindowRect) {
+    UNUSED;
+    pthread_mutex_lock(&user_mu);
+    Window *w = win_get(a[0]);
+    int32_t v[4] = {0, 0, SCREEN_W, SCREEN_H};
+    if (w && a[0] != main_hwnd) {
+        v[0] = w->x, v[1] = w->y, v[2] = w->x + w->w, v[3] = w->y + w->h;
+    }
+    pthread_mutex_unlock(&user_mu);
+    if (a[0] == 0x00010000u) { /* the desktop */
+        v[0] = v[1] = 0, v[2] = SCREEN_W, v[3] = SCREEN_H;
+    } else if (!w) {
+        return 0;
+    }
+    rect_put(a[1], v);
+    return 1;
+}
+static void move_window(uint32_t hwnd, int32_t x, int32_t y, int32_t w_, int32_t h, int move, int size) {
+    pthread_mutex_lock(&user_mu);
+    Window *w = win_get(hwnd);
+    if (w) {
+        if (move) w->x = x, w->y = y;
+        if (size) w->w = w_, w->h = h;
+    }
+    pthread_mutex_unlock(&user_mu);
+}
+/* SetWindowPos(hwnd, after, x, y, cx, cy, flags) */
+H(user_SetWindowPos) {
+    UNUSED;
+    move_window(a[0], (int32_t)a[2], (int32_t)a[3], (int32_t)a[4], (int32_t)a[5], !(a[6] & 2), !(a[6] & 1));
+    if (a[6] & 0x40) { /* SWP_SHOWWINDOW */
+        uint32_t args[2] = {a[0], 5};
+        user_ShowWindow(c, args);
+    }
+    return 1;
+}
+H(user_MoveWindow) {
+    UNUSED;
+    move_window(a[0], (int32_t)a[1], (int32_t)a[2], (int32_t)a[3], (int32_t)a[4], 1, 1);
+    return 1;
+}
+H(user_IsWindow) {
+    UNUSED;
+    pthread_mutex_lock(&user_mu);
+    int ok = win_get(a[0]) != NULL;
+    pthread_mutex_unlock(&user_mu);
+    return (uint32_t)ok;
+}
+H(user_IsWindowVisible) {
+    UNUSED;
+    pthread_mutex_lock(&user_mu);
+    Window *w = win_get(a[0]);
+    int v = w && w->visible;
+    pthread_mutex_unlock(&user_mu);
+    return (uint32_t)v;
+}
+H(user_IsIconic) { UNUSED; return 0; }
+H(user_GetDesktopWindow) { UNUSED; return 0x00010000u; }
+H(user_GetForegroundWindow) { UNUSED; return active_hwnd; }
+H(user_GetActiveWindow) { UNUSED; return active_hwnd; }
+H(user_GetFocus) { UNUSED; return focus_hwnd; }
+H(user_GetTopWindow) { UNUSED; return main_hwnd; }
+H(user_GetWindow) { UNUSED; return 0; }
+H(user_GetParent) {
+    UNUSED;
+    pthread_mutex_lock(&user_mu);
+    Window *w = win_get(a[0]);
+    uint32_t p = w ? w->parent : 0;
+    pthread_mutex_unlock(&user_mu);
+    return p;
+}
+H(user_GetWindowThreadProcessId) {
+    UNUSED;
+    pthread_mutex_lock(&user_mu);
+    Window *w = win_get(a[0]);
+    uint32_t tid = w ? w->owner->tid : 0;
+    pthread_mutex_unlock(&user_mu);
+    if (a[1]) st32(a[1], 0x10); /* the process id GetCurrentProcessId reports */
+    return tid;
+}
+H(user_EnumThreadWindows) { UNUSED; return 1; }
+H(user_BringWindowToTop) { UNUSED; return 1; }
+H(user_RedrawWindow) { UNUSED; return 1; }
+H(user_InvalidateRect) { UNUSED; return 1; }
+H(user_ValidateRect) { UNUSED; return 1; }
+H(user_ScreenToClient) { UNUSED; return 1; } /* the main window sits at 0,0 */
+H(user_GetCursorPos) {
+    UNUSED;
+    st32(a[0], (uint32_t)rt_mouse_x);
+    st32(a[0] + 4, (uint32_t)rt_mouse_y);
+    return 1;
+}
+H(user_ClipCursor) { UNUSED; return 1; }
+H(user_SetCapture) { UNUSED; static uint32_t cap; uint32_t o = cap; cap = a[0]; return o; }
+H(user_ReleaseCapture) { UNUSED; return 1; }
+H(user_GetAsyncKeyState) {
+    UNUSED;
+    uint32_t vk = a[0] & 0xFF;
+    int down;
+    if (vk == 1) down = rt_mouse_buttons & 1;
+    else if (vk == 2) down = rt_mouse_buttons & 2;
+    else if (vk == 4) down = rt_mouse_buttons & 4;
+    else down = rt_vk_state[vk] & 0x80;
+    return down ? 0xFFFF8000u : 0;
+}
+/* MapVirtualKeyA(code, type): 0 VK->scan, 1 scan->VK, 2 VK->char. */
+H(user_MapVirtualKeyA) {
+    UNUSED;
+    static const uint8_t scan_of_letter[26] = {0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                                               0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                                               0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+    uint32_t k = a[0];
+    switch (a[1]) {
+    case 0:
+        if (k >= 'A' && k <= 'Z') return scan_of_letter[k - 'A'];
+        if (k >= '1' && k <= '9') return 2 + (k - '1');
+        if (k == '0') return 0x0B;
+        switch (k) {
+        case 0x08: return 0x0E; case 0x09: return 0x0F; case 0x0D: return 0x1C; case 0x1B: return 0x01;
+        case 0x20: return 0x39; case 0x10: return 0x2A; case 0x11: return 0x1D; case 0x12: return 0x38;
+        default: return 0;
+        }
+    case 1:
+        for (int i = 0; i < 26; i++)
+            if (scan_of_letter[i] == k) return 'A' + (uint32_t)i;
+        if (k >= 2 && k <= 10) return '1' + (k - 2);
+        if (k == 0x0B) return '0';
+        return 0;
+    case 2:
+        if ((k >= 'A' && k <= 'Z') || (k >= '0' && k <= '9') || k == ' ') return k;
+        return 0;
+    default: return 0;
+    }
+}
+H(user_GetKeyboardLayout) { UNUSED; return 0x04090409u; }
+H(user_GetKeyboardLayoutList) {
+    UNUSED;
+    if (a[0] && a[1]) st32(a[1], 0x04090409u);
+    return 1;
+}
+H(user_GetCaretBlinkTime) { UNUSED; return 530; }
+H(user_MessageBeep) { UNUSED; return 1; }
+H(user_GetSystemMetrics) {
+    UNUSED;
+    switch (a[0]) {
+    case SM_CXSCREEN: case 78: case 16: return (uint32_t)SCREEN_W; /* also SM_CXVIRTUALSCREEN, SM_CXFULLSCREEN */
+    case SM_CYSCREEN: case 79: case 17: return (uint32_t)SCREEN_H;
+    case 2: case 3: return 16;  /* SM_CXVSCROLL, SM_CYHSCROLL */
+    case 4: return 19;          /* SM_CYCAPTION */
+    case 5: case 6: return 1;   /* SM_CXBORDER */
+    case 7: case 8: return 3;   /* SM_CXDLGFRAME */
+    case 11: case 12: return 32; /* SM_CXICON */
+    case 13: case 14: return 32; /* SM_CXCURSOR */
+    case 19: return 1;          /* SM_MOUSEPRESENT */
+    case 32: case 33: return 4; /* SM_CXFRAME */
+    case 36: case 37: return 4; /* SM_CXDOUBLECLK */
+    case 43: return 3;          /* SM_CMOUSEBUTTONS */
+    case 80: return 1;          /* SM_CMONITORS */
+    default: return 0;
+    }
+}
+/* SystemParametersInfo(action, uiParam, pvParam, winIni) */
+H(user_SystemParametersInfo) {
+    UNUSED;
+    switch (a[0]) {
+    case 0x0030: /* SPI_GETWORKAREA */ {
+        int32_t v[4] = {0, 0, SCREEN_W, SCREEN_H};
+        rect_put(a[2], v);
+        return 1;
+    }
+    case 0x000A: case 0x0016: case 0x0068: case 0x0003: /* mouse speed, keyboard delay ... */
+        if (a[2]) st32(a[2], 0);
+        return 1;
+    default:
+        if (a[2] && a[0] < 0x1000 && (a[0] & 1) == 0) st32(a[2], 0); /* a GET: report "off" */
+        return 1;
+    }
+}
+
+/* ---------------------------------------------------------- display modes */
+static const struct { int w, h; } display_modes[] = {{640, 480}, {800, 600}, {1024, 768}, {1280, 1024}};
+
+/* ChangeDisplaySettingsEx(device, DEVMODE*, hwnd, flags, param). DEVMODEA has
+ * dmBitsPerPel at 104, dmPelsWidth at 108, dmPelsHeight at 112; DEVMODEW has
+ * the same fields 64 bytes later (the two name arrays are WCHAR). */
+static uint32_t change_display(uint32_t dm, int wide) {
+    if (!dm) return 0; /* back to the registry mode */
+    uint32_t o = wide ? 64 : 0;
+    uint32_t fields = ld32(dm + o + 40);
+    int w = (fields & 0x80000) ? (int)ld32(dm + o + 108) : screen_w;
+    int h = (fields & 0x100000) ? (int)ld32(dm + o + 112) : screen_h;
+    int bpp = (fields & 0x40000) ? (int)ld32(dm + o + 104) : screen_bpp;
+    int ok = 0;
+    for (size_t i = 0; i < RT_COUNTOF(display_modes); i++) ok |= display_modes[i].w == w && display_modes[i].h == h;
+    if (!ok || (bpp != 16 && bpp != 32)) {
+        rt_log("[user] ChangeDisplaySettings %dx%dx%d: not a mode the runtime offers\n", w, h, bpp);
+        return (uint32_t)-2; /* DISP_CHANGE_BADMODE */
+    }
+    screen_w = w, screen_h = h, screen_bpp = bpp;
+    if (g_opt.verbose) rt_log("[user] display mode %dx%dx%d\n", w, h, bpp);
+    return 0; /* DISP_CHANGE_SUCCESSFUL */
+}
+void rt_user_set_display_mode(int w, int h, int bpp) {
+    if (g_opt.verbose && (w != screen_w || h != screen_h)) rt_log("[user] display mode %dx%dx%d (Direct3D)\n", w, h, bpp);
+    screen_w = w, screen_h = h, screen_bpp = bpp;
+}
+
+void rt_user_fullscreen_window(CPU *c, uint32_t hwnd, int w, int h, int bpp) {
+    rt_user_set_display_mode(w, h, bpp);
+    pthread_mutex_lock(&user_mu);
+    Window *win = win_get(hwnd);
+    int changed = win && (win->x || win->y || win->w != w || win->h != h);
+    if (win) win->x = 0, win->y = 0, win->w = w, win->h = h;
+    pthread_mutex_unlock(&user_mu);
+    if (!changed) return;
+    uint32_t r;
+    if (!send_message(c, hwnd, WM_MOVE, 0, 0, &r)) return;
+    send_message(c, hwnd, WM_SIZE, 0 /* SIZE_RESTORED */, (uint32_t)(h << 16 | (w & 0xFFFF)), &r);
+}
+
+H(user_ChangeDisplaySettingsA) { UNUSED; return change_display(a[0], 0); }
+H(user_ChangeDisplaySettingsW) { UNUSED; return change_display(a[0], 1); }
+H(user_ChangeDisplaySettingsExA) { UNUSED; return change_display(a[1], 0); }
+H(user_ChangeDisplaySettingsExW) { UNUSED; return change_display(a[1], 1); }
+
+/* EnumDisplaySettings(device, mode, DEVMODE*) with ENUM_CURRENT_SETTINGS = -1. */
+static uint32_t enum_display(uint32_t mode, uint32_t dm, int wide) {
+    uint32_t o = wide ? 64 : 0;
+    int w, h, bpp;
+    if (mode == 0xFFFFFFFFu || mode == 0xFFFFFFFEu) {
+        w = screen_w, h = screen_h, bpp = screen_bpp;
+    } else {
+        uint32_t n = (uint32_t)RT_COUNTOF(display_modes);
+        if (mode >= 2 * n) return 0;
+        w = display_modes[mode % n].w, h = display_modes[mode % n].h, bpp = mode < n ? 16 : 32;
+    }
+    st16(dm + o + 36, (uint16_t)(o + 156)); /* dmSize */
+    st32(dm + o + 40, 0x40000 | 0x80000 | 0x100000 | 0x400000);
+    st32(dm + o + 104, (uint32_t)bpp);
+    st32(dm + o + 108, (uint32_t)w);
+    st32(dm + o + 112, (uint32_t)h);
+    st32(dm + o + 120, 60); /* dmDisplayFrequency */
+    return 1;
+}
+H(user_EnumDisplaySettingsA) { UNUSED; return enum_display(a[1], a[2], 0); }
+H(user_EnumDisplaySettingsW) { UNUSED; return enum_display(a[1], a[2], 1); }
+H(user_EnumDisplayDevicesW) {
+    UNUSED;
+    /* DISPLAY_DEVICEW: cb, DeviceName[32], DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128] */
+    if (a[1] != 0) return 0;
+    uint32_t p = a[2];
+    rt_put_wstr(p + 4, 32, "\\\\.\\DISPLAY1");
+    rt_put_wstr(p + 68, 128, "Recompilation display");
+    st32(p + 324, 0x5); /* ATTACHED_TO_DESKTOP | PRIMARY_DEVICE */
+    return 1;
+}
+
+/* ------------------------------------------------------------- painting */
+/* BeginPaint(hwnd, PAINTSTRUCT*): nothing is drawn through GDI windows. */
+H(user_BeginPaint) {
+    UNUSED;
+    memset(G(a[1]), 0, 64);
+    st32(a[1], HDC_FAKE);
+    return HDC_FAKE;
+}
+H(user_EndPaint) { UNUSED; return 1; }
+H(user_FillRect) { UNUSED; return 1; }
+
+/* ----------------------------------------------- clipboard, menus, dialogs */
+H(user_false) { UNUSED; return 0; }
+H(user_true) { UNUSED; return 1; }
+
+/* ------------------------------------------------------------- dialogs */
+/* Skip a DLGTEMPLATE sz_Or_Ord field; copy a string one into out. */
+static uint32_t dlg_field(uint32_t p, char *out, size_t cap) {
+    if (out) out[0] = 0;
+    uint16_t w = ld16(p);
+    if (w == 0) return p + 2;
+    if (w == 0xFFFF) {
+        if (out) snprintf(out, cap, "#%u", ld16(p + 2));
+        return p + 4;
+    }
+    if (out) rt_get_wstr(p, out, cap);
+    return p + 2 * (rt_wlen(p) + 1);
+}
+/* DialogBoxIndirectParamW(hinst, template, parent, proc, param). Dialogs cannot be
+ * shown: the template's title and texts are logged and the answer is IDOK. */
+H(user_DialogBoxIndirectParamW) {
+    UNUSED;
+    uint32_t t = a[1];
+    int ex = ld16(t) == 1 && ld16(t + 2) == 0xFFFF;
+    uint32_t style = ex ? ld32(t + 12) : ld32(t);
+    uint16_t n = ex ? ld16(t + 16) : ld16(t + 8);
+    uint32_t p = t + (ex ? 26 : 18);
+    char title[256], text[512];
+    p = dlg_field(p, NULL, 0);           /* menu */
+    p = dlg_field(p, NULL, 0);           /* class */
+    p = dlg_field(p, title, sizeof title);
+    if (style & 0x40) {                  /* DS_SETFONT */
+        p += ex ? 6 : 2;
+        p = dlg_field(p, NULL, 0);
+    }
+    rt_log("[user] dialog \"%s\" (%u controls) answered IDOK\n", title, n);
+    for (uint16_t i = 0; i < n; i++) {
+        p = (p + 3) & ~3u;
+        p += ex ? 24 : 18;
+        char cls[64];
+        p = dlg_field(p, cls, sizeof cls);
+        p = dlg_field(p, text, sizeof text);
+        uint16_t extra = ld16(p);
+        p += 2 + extra;
+        if (text[0] && text[0] != '#') rt_log("[user]   %s: %s\n", cls, text);
+    }
+    return 1;
+}
+
+/* ---------------------------------------------------------- characters */
+static uint32_t wcase(uint32_t p, int upper) {
+    if (p < 0x10000) { /* a single character */
+        if (upper && p >= 'a' && p <= 'z') return p - 32;
+        if (!upper && p >= 'A' && p <= 'Z') return p + 32;
+        return p;
+    }
+    for (uint32_t q = p; ld16(q); q += 2) {
+        uint16_t ch = ld16(q);
+        if (upper && ch >= 'a' && ch <= 'z') st16(q, (uint16_t)(ch - 32));
+        if (!upper && ch >= 'A' && ch <= 'Z') st16(q, (uint16_t)(ch + 32));
+    }
+    return p;
+}
+H(user_CharUpperW) { UNUSED; return wcase(a[0], 1); }
+H(user_CharLowerW) { UNUSED; return wcase(a[0], 0); }
+H(user_CharNextA) { UNUSED; return ld8(a[0]) ? a[0] + 1 : a[0]; }
+
 static const ImportDef defs[] = {
     {"user32.dll", "RegisterClassA", user_RegisterClassA, 1, 0},
+    {"user32.dll", "RegisterClassExA", user_RegisterClassExA, 1, 0},
+    {"user32.dll", "RegisterClassW", user_RegisterClassW, 1, 0},
+    {"user32.dll", "RegisterClassExW", user_RegisterClassExW, 1, 0},
+    {"user32.dll", "UnregisterClassA", user_UnregisterClass, 2, 0},
+    {"user32.dll", "UnregisterClassW", user_UnregisterClass, 2, 0},
+    {"user32.dll", "CreateWindowExW", user_CreateWindowExW, 12, 0},
+    {"user32.dll", "DefWindowProcW", user_DefWindowProcA, 4, 0},
+    {"user32.dll", "CallWindowProcW", user_CallWindowProcA, 5, 0},
+    {"user32.dll", "SendMessageW", user_SendMessageA, 4, 0},
+    {"user32.dll", "PostMessageA", user_PostMessageA, 4, 0},
+    {"user32.dll", "PostMessageW", user_PostMessageA, 4, 0},
+    {"user32.dll", "GetWindowLongW", user_GetWindowLongA, 2, 0},
+    {"user32.dll", "SetWindowLongW", user_SetWindowLongA, 3, 0},
+    {"user32.dll", "GetWindowTextW", user_GetWindowTextW, 3, 0},
+    {"user32.dll", "SetWindowTextW", user_SetWindowTextW, 2, 0},
+    {"user32.dll", "PeekMessageW", user_PeekMessageA, 5, 0},
+    {"user32.dll", "GetMessageW", user_GetMessageA, 4, 0},
+    {"user32.dll", "DispatchMessageW", user_DispatchMessageA, 1, 0},
+    {"user32.dll", "MessageBoxW", user_MessageBoxW, 4, 0},
+    {"user32.dll", "LoadCursorW", user_LoadCursorW, 2, 0},
+    {"user32.dll", "LoadIconA", user_LoadIcon, 2, 0},
+    {"user32.dll", "LoadIconW", user_LoadIcon, 2, 0},
+    {"user32.dll", "DestroyCursor", user_true, 1, 0},
+    {"user32.dll", "SetRect", user_SetRect, 5, 0},
+    {"user32.dll", "SetRectEmpty", user_SetRectEmpty, 1, 0},
+    {"user32.dll", "IsRectEmpty", user_IsRectEmpty, 1, 0},
+    {"user32.dll", "EqualRect", user_EqualRect, 2, 0},
+    {"user32.dll", "IntersectRect", user_IntersectRect, 3, 0},
+    {"user32.dll", "PtInRect", user_PtInRect, 3, 0},
+    {"user32.dll", "OffsetRect", user_OffsetRect, 3, 0},
+    {"user32.dll", "AdjustWindowRect", user_AdjustWindowRect, 3, 0},
+    {"user32.dll", "AdjustWindowRectEx", user_AdjustWindowRect, 4, 0},
+    {"user32.dll", "GetWindowRect", user_GetWindowRect, 2, 0},
+    {"user32.dll", "SetWindowPos", user_SetWindowPos, 7, 0},
+    {"user32.dll", "MoveWindow", user_MoveWindow, 6, 0},
+    {"user32.dll", "IsWindow", user_IsWindow, 1, 0},
+    {"user32.dll", "IsWindowVisible", user_IsWindowVisible, 1, 0},
+    {"user32.dll", "IsIconic", user_IsIconic, 1, 0},
+    {"user32.dll", "GetDesktopWindow", user_GetDesktopWindow, 0, 0},
+    {"user32.dll", "GetForegroundWindow", user_GetForegroundWindow, 0, 0},
+    {"user32.dll", "GetActiveWindow", user_GetActiveWindow, 0, 0},
+    {"user32.dll", "GetFocus", user_GetFocus, 0, 0},
+    {"user32.dll", "GetTopWindow", user_GetTopWindow, 1, 0},
+    {"user32.dll", "GetWindow", user_GetWindow, 2, 0},
+    {"user32.dll", "GetParent", user_GetParent, 1, 0},
+    {"user32.dll", "GetWindowThreadProcessId", user_GetWindowThreadProcessId, 2, 0},
+    {"user32.dll", "EnumThreadWindows", user_EnumThreadWindows, 3, 0},
+    {"user32.dll", "BringWindowToTop", user_BringWindowToTop, 1, 0},
+    {"user32.dll", "RedrawWindow", user_RedrawWindow, 4, 0},
+    {"user32.dll", "InvalidateRect", user_InvalidateRect, 3, 0},
+    {"user32.dll", "ValidateRect", user_ValidateRect, 2, 0},
+    {"user32.dll", "ScreenToClient", user_ScreenToClient, 2, 0},
+    {"user32.dll", "GetCursorPos", user_GetCursorPos, 1, 0},
+    {"user32.dll", "ClipCursor", user_ClipCursor, 1, 0},
+    {"user32.dll", "SetCapture", user_SetCapture, 1, 0},
+    {"user32.dll", "ReleaseCapture", user_ReleaseCapture, 0, 0},
+    {"user32.dll", "GetAsyncKeyState", user_GetAsyncKeyState, 1, 0},
+    {"user32.dll", "MapVirtualKeyA", user_MapVirtualKeyA, 2, 0},
+    {"user32.dll", "MapVirtualKeyW", user_MapVirtualKeyA, 2, 0},
+    {"user32.dll", "GetKeyboardLayout", user_GetKeyboardLayout, 1, 0},
+    {"user32.dll", "GetKeyboardLayoutList", user_GetKeyboardLayoutList, 2, 0},
+    {"user32.dll", "GetCaretBlinkTime", user_GetCaretBlinkTime, 0, 0},
+    {"user32.dll", "MessageBeep", user_MessageBeep, 1, 0},
+    {"user32.dll", "GetSystemMetrics", user_GetSystemMetrics, 1, 0},
+    {"user32.dll", "SystemParametersInfoA", user_SystemParametersInfo, 4, 0},
+    {"user32.dll", "SystemParametersInfoW", user_SystemParametersInfo, 4, 0},
+    {"user32.dll", "ChangeDisplaySettingsA", user_ChangeDisplaySettingsA, 2, 0},
+    {"user32.dll", "ChangeDisplaySettingsW", user_ChangeDisplaySettingsW, 2, 0},
+    {"user32.dll", "ChangeDisplaySettingsExA", user_ChangeDisplaySettingsExA, 5, 0},
+    {"user32.dll", "ChangeDisplaySettingsExW", user_ChangeDisplaySettingsExW, 5, 0},
+    {"user32.dll", "EnumDisplaySettingsA", user_EnumDisplaySettingsA, 3, 0},
+    {"user32.dll", "EnumDisplaySettingsW", user_EnumDisplaySettingsW, 3, 0},
+    {"user32.dll", "EnumDisplayDevicesW", user_EnumDisplayDevicesW, 4, 0},
+    {"user32.dll", "BeginPaint", user_BeginPaint, 2, 0},
+    {"user32.dll", "EndPaint", user_EndPaint, 2, 0},
+    {"user32.dll", "FillRect", user_FillRect, 3, 0},
+    {"user32.dll", "OpenClipboard", user_false, 1, 0},
+    {"user32.dll", "CloseClipboard", user_true, 0, 0},
+    {"user32.dll", "EmptyClipboard", user_false, 0, 0},
+    {"user32.dll", "SetClipboardData", user_false, 2, 0},
+    {"user32.dll", "GetClipboardData", user_false, 1, 0},
+    {"user32.dll", "IsClipboardFormatAvailable", user_false, 1, 0},
+    {"user32.dll", "GetMenu", user_false, 1, 0},
+    {"user32.dll", "DestroyMenu", user_true, 1, 0},
+    {"user32.dll", "EndDialog", user_true, 2, 0},
+    {"user32.dll", "DialogBoxIndirectParamW", user_DialogBoxIndirectParamW, 5, 0},
+    {"user32.dll", "GetDlgItem", user_false, 2, 0},
+    {"user32.dll", "GetScrollPos", user_false, 2, 0},
+    {"user32.dll", "CharUpperW", user_CharUpperW, 1, 0},
+    {"user32.dll", "CharLowerW", user_CharLowerW, 1, 0},
+    {"user32.dll", "CharNextA", user_CharNextA, 1, 0},
     {"user32.dll", "CreateWindowExA", user_CreateWindowExA, 12, 0},
     {"user32.dll", "DestroyWindow", user_DestroyWindow, 1, 0},
     {"user32.dll", "DefWindowProcA", user_DefWindowProcA, 4, 0},
@@ -1215,6 +1870,7 @@ static const ImportDef defs[] = {
     {"user32.dll", "GetKeyState", user_GetKeyState, 1, 0},
     {"user32.dll", "MessageBoxA", user_MessageBoxA, 4, 0},
     {"user32.dll", "wsprintfA", user_wsprintfA, 2, 1},
+    {"user32.dll", "wsprintfW", user_wsprintfW, 2, 1},
     {"user32.dll", "GetDC", user_GetDC, 1, 0},
     {"user32.dll", "ReleaseDC", user_ReleaseDC, 2, 0},
     {"gdi32.dll", "GetDeviceCaps", gdi_GetDeviceCaps, 2, 0},
