@@ -34,7 +34,7 @@ opt="${OPT:--O1}"
 # (npkcrypt) are stubbed in the runtime. Each DLL keeps its own ImageBase.
 modules=(
     "msmain    GMSv62.exe      -   $build/survey/GMSv62.functions.csv     -"
-    "msvcrt    msvcrt.dll      -   $build/survey/msvcrt.functions.csv      -"
+    "msvcrt    $orig/syslib/msvcrt.dll   -   $build/survey/msvcrt.functions.csv   -"
     "pcom      PCOM.dll        -   $build/survey/PCOM.functions.csv        -"
     "namespace NameSpace.dll   -   $build/survey/NameSpace.functions.csv   -"
     "resman    ResMan.dll      -   $build/survey/ResMan.functions.csv      -"
@@ -59,7 +59,8 @@ for line in "${modules[@]}"; do
        [ "$here/tools/data_code_pointers.py" -nt "$merged_csv" ]; then
         echo "== merging data-section code pointers for $file"
         cp "$ghidra_csv" "$merged_csv"
-        python3 "$here/tools/data_code_pointers.py" "$orig/$file" "$ghidra_csv" >>"$merged_csv"
+        case "$file" in /*) mpe="$file" ;; *) mpe="$orig/$file" ;; esac
+        python3 "$here/tools/data_code_pointers.py" "$mpe" "$ghidra_csv" >>"$merged_csv"
     fi
 done
 
