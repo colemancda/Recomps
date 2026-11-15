@@ -260,10 +260,15 @@ static RtImage *load_dll(const char *name, int depth) {
     if (!desc) return NULL;
     if (depth > 8 || g_ndlls == RT_MAX_DLLS) die("too many lifted DLLs, or an import cycle", desc->name);
     char path[512];
-    char self[512];
+    char self[512], syslib[512];
     program_dir(self, sizeof self);
-    /* The game's DLLs are in its folder; system DLLs the program lifts (msxml4) next to the program. */
+    /* The game's DLLs are in its folder; system DLLs the program lifts but a real
+     * install loads from system32 (msvcrt) go in a "syslib" subfolder, so the
+     * client's own directory scan (GameGuard's DLL-planting check) does not see
+     * them at the top level. */
+    snprintf(syslib, sizeof syslib, "%s/syslib", g_opt.gamedir);
     if (!find_file(g_opt.gamedir, desc->name, path, sizeof path) &&
+        !find_file(syslib, desc->name, path, sizeof path) &&
         !find_file(g_opt.exedir, desc->name, path, sizeof path) && !find_file(self, desc->name, path, sizeof path)) {
         fprintf(stderr, "recomp: lifted DLL %s not found in %s\n", desc->name, g_opt.gamedir);
         exit(2);
