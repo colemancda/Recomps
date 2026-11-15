@@ -23,6 +23,9 @@ static Module modules[] = {
     {"kernel32.dll", 1, 0}, {"user32.dll", 1, 0},  {"gdi32.dll", 1, 0},    {"advapi32.dll", 1, 0},
     {"ntdll.dll", 1, 0},    {"ws2_32.dll", 1, 0},  {"winmm.dll", 1, 0},    {"imm32.dll", 1, 0},
     {"ole32.dll", 1, 0},    {"oleaut32.dll", 1, 0}, {"shell32.dll", 1, 0}, {"ddraw.dll", 0, 0},
+    {"shfolder.dll", 0, 0}, {"version.dll", 1, 0}, {"rpcrt4.dll", 1, 0},
+    /* The DirectPlay NAT helper: the game takes a loadable one as proof of DirectX 8.1. */
+    {"dpnhpast.dll", 0, 0},
     {"dsound.dll", 0, 0},   {"dinput8.dll", 0, 0},  {"d3d8.dll", 0, 0},     {"ebueulax.dll", 0, 0},
 };
 #define MODULE_BASE 0x70000000u
@@ -44,6 +47,11 @@ static const Module *module_of(uint32_t h) {
     uint32_t i = (h - MODULE_BASE) / MODULE_STEP;
     if (h < MODULE_BASE || (h - MODULE_BASE) % MODULE_STEP || i >= RT_COUNTOF(modules)) return NULL;
     return &modules[i];
+}
+
+const char *rt_module_name(uint32_t h) {
+    const Module *m = module_of(h);
+    return m ? m->name : NULL;
 }
 
 H(k32_GetModuleHandleA) {
@@ -74,6 +82,7 @@ H(k32_LoadLibraryA) {
         return im->base;
     }
     int i = module_index(name);
+    if (i < 0 && (im = rt_load_data_dll(name)) != NULL) return im->base;
     if (i < 0) {
         rt_log("recomp: LoadLibraryA(\"%s\"): no such module in the runtime\n", name);
         rt_set_last_error(c, 126);
@@ -102,23 +111,20 @@ H(k32_GetProcAddress) {
         rt_set_last_error(c, 6);
         return 0;
     }
+    char ordname[16];
+    const char *name;
     if (a[1] < 0x10000) {
-        rt_log("recomp: GetProcAddress(%s, ordinal %u) is not supported\n", m->name, a[1]);
-        rt_set_last_error(c, 127);
-        return 0;
+        snprintf(ordname, sizeof ordname, "#%u", a[1]);
+        name = ordname;
+    } else {
+        name = rt_gstr(a[1]);
     }
-    const char *name = rt_gstr(a[1]);
     const ImportDef *def = rt_find_import_def(m->name, name);
     if (!def) {
         /* The C run-time probes kernel32 for optional functions and copes without them. */
         if (g_opt.verbose || g_trace_imports || !m->system)
             rt_log("recomp: GetProcAddress(%s, \"%s\"): not provided\n", m->name, name);
         rt_set_last_error(c, 127); /* ERROR_PROC_NOT_FOUND */
-        return 0;
-    }
-    if (def->is_cdecl) {
-        rt_log("recomp: GetProcAddress(%s, \"%s\"): cdecl functions cannot be looked up by name\n", m->name, name);
-        rt_set_last_error(c, 127);
         return 0;
     }
     return rt_host_fn(m->name, name, def->fn, def->nargs);
@@ -246,8 +252,11 @@ H(k32_CreateProcessA) {
     return 0;
 }
 
+H(k32_CreateProcessW) { return rt_call_a(c, a, 10, "kernel32.dll", "CreateProcessA", 3); }
+
 static const ImportDef defs[] = {
     {"kernel32.dll", "GetModuleHandleA", k32_GetModuleHandleA, 1, 0},
+    {"kernel32.dll", "CreateProcessW", k32_CreateProcessW, 10, 0},
     {"kernel32.dll", "LoadLibraryA", k32_LoadLibraryA, 1, 0},
     {"kernel32.dll", "FreeLibrary", k32_FreeLibrary, 1, 0},
     {"kernel32.dll", "GetProcAddress", k32_GetProcAddress, 2, 0},
