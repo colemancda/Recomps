@@ -269,6 +269,10 @@ class Translator:
     def t_lahf(self, ins):
         return Tr("AH = rt_lahf(c);", uses=1 | 2 | 4 | 8 | 16)
 
+    def t_xlatb(self, ins):
+        # AL = [EBX + AL] (ds: the flat segment); msvcrt's x87 helpers dispatch through it
+        return Tr("AL = ld8(EBX + AL);")
+
     def t_sahf(self, ins):
         return Tr("rt_sahf(c, AH);", kills=1 | 2 | 4 | 8 | 16)
 
