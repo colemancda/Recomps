@@ -516,6 +516,7 @@ H(oa_VariantChangeType) {
     int64_t iv = 0;
     int have_int = 1;
     switch (from) {
+    case 0: case 1: iv = 0; break;                                  /* VT_EMPTY, VT_NULL -> 0 */
     case 2: iv = (int16_t)(val[0] | val[1] << 8); break;            /* VT_I2 */
     case 3: case 22: iv = (int32_t)ld32(a[1] + 8); break;           /* VT_I4, VT_INT */
     case 11: iv = (val[0] | val[1]) ? -1 : 0; break;                /* VT_BOOL */
