@@ -265,3 +265,39 @@ and (for `_com_error`) HRESULT; `RECOMP_TRACE_EXIT=1` dumps a guest backtrace at
 `DISPLAY=:99 ./build/host/maple --exe orig/GMSv62.exe --gamedir orig
 --savedir <dir> --frames N --dump-every K --dump-path f_%d.png` against a mock
 server that sends the v62 handshake (Xvfb for the window + message pump).
+
+## MILESTONE: the interactive login screen renders
+
+Past the splash screens, three more fixes reached the actual MapleStory login
+screen (logo, forest background, Login ID / Password fields, Log in button):
+
+5. **GameGuard KeyCrypt init** (`runtime/maple.c`). `FUN_00867060` stores
+   `NPKOpenDriver`'s return in the KeyCrypt slot and throws
+   `CSecurityKeyCryptInitFailed` if it is <= 0, and treats
+   `NPKGetAppCompatFlag == -1` as "compatible". So NPKOpenDriver reports a
+   positive handle and NPKGetAppCompatFlag returns -1.
+
+6. **npkcrypt stdcall arg counts** (`runtime/maple.c`). NPKOpenDriver takes 0
+   args, NPKGetAppCompatFlag 1, NPKSetAppCompatFlag 2, NPKRegisterCryptWindowMsg
+   3 (per the call sites). They are `__stdcall`; the previously wrong counts
+   corrupted the guest stack *once the KeyCrypt init success path ran them*
+   (before, the throw aborted first), yielding a garbage object pointer and a
+   SIGSEGV during title-screen setup.
+
+7. **VariantChangeType from VT_EMPTY / VT_NULL -> 0** (`runtime/stubs.c`). The
+   title screen reads properties that are sometimes empty and converts them to an
+   integer; the missing conversion returned DISP_E_TYPEMISMATCH and the caller
+   used the bad result as a pointer (return to a junk address). Empty/null now
+   convert to 0.
+
+Result: **exit 0**, 2500+ frames, no crashes, and the full interactive login
+screen renders (title screen after the Nexon/Wizet splash). The recompiled v62
+client now boots -> connects -> v62 handshake -> mounts all .wz -> passes
+GameGuard KeyCrypt -> renders the login screen.
+
+### Next steps
+- Drive input (type credentials, click Log in) and complete the login against a
+  real `MapleStoryServer62`, so the handshake is followed by a login packet
+  exchange. Remaining `VariantChangeType 13 -> 19` (VT_UNKNOWN -> VT_UI4) warnings
+  are non-fatal but worth filling in if a later screen needs them.
+- Then character selection / world entry, sound, and the aarch64 / handheld build.
