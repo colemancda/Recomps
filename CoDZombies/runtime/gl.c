@@ -183,6 +183,12 @@ static void eglSwapBuffers(CPU *c) {            /* (dpy, surface) */
     static uint32_t every;
     if (!every) { const char *e = getenv("RT_FRAME_LOG"); every = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 600; }
     if (++frames <= 3 || frames % every == 0) rt_log("eglSwapBuffers: frame %u", frames);
+    static const char *peek = (const char *)1;
+    if (peek == (const char *)1) peek = getenv("RT_PEEK");   /* "addr,offset": log [[addr]+offset] */
+    if (peek && frames % every == 0) {
+        unsigned a = 0, o = 0;
+        if (sscanf(peek, "%x,%x", &a, &o) == 2 && ld32(a)) rt_log("peek [[%08x]+%x] = %d", a, o, (int32_t)ld32(ld32(a) + o));
+    }
     if (g_gl_real) gl_real_swap(frames);
     input_frame(frames);
     egl_true(c, 1);
