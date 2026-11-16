@@ -64,9 +64,9 @@ void imports_init(void) {
     s3e_by_impl = calloc(n, sizeof(ImportFn));
     s3e_names = calloc(n, sizeof(char *));
     missing_seen = calloc(g_import_stub_count, 1);
-    const ImportImpl *tables[] = {g_s3e_impls, g_compress_impls};
-    const uint32_t counts[] = {g_s3e_impl_count, g_compress_impl_count};
-    for (int t = 0; t < 2; t++) {
+    const ImportImpl *tables[] = {g_s3e_impls, g_compress_impls, g_gl_impls};
+    const uint32_t counts[] = {g_s3e_impl_count, g_compress_impl_count, g_gl_impl_count};
+    for (int t = 0; t < 3; t++) {
         for (uint32_t k = 0; k < counts[t]; k++) {
             uint32_t i = (tables[t][k].impl - TEXT_LO) / 4;
             s3e_by_impl[i] = tables[t][k].fn;
@@ -86,6 +86,13 @@ static const ImportStub *find_stub(uint32_t stub) {
 }
 
 ImportFn gl_lookup(const char *name);   /* gl.c */
+
+uint32_t import_stub_by_name(const char *name) {
+    for (uint32_t k = 0; k < g_import_stub_count; k++)
+        if (g_import_stubs[k].kind == IMPORT_GL && g_import_stubs[k].name && !strcmp(g_import_stubs[k].name, name))
+            return g_import_stubs[k].stub;
+    return 0;
+}
 
 /* For the import log: a guest pointer to a short printable C string, else NULL. */
 static const char *maybe_str(uint32_t a) {
@@ -109,7 +116,11 @@ void rt_import(CPU *c, uint32_t stub) {
         fn = s3e_by_impl[i];
         if (s3e_names[i]) name = s3e_names[i];
     } else if (s->kind == IMPORT_GL) {
-        fn = gl_lookup(s->name);
+        static ImportFn *gl_cache;
+        if (!gl_cache) gl_cache = calloc(g_import_stub_count, sizeof(ImportFn));
+        uint32_t k = (uint32_t)(s - g_import_stubs);
+        if (!gl_cache[k]) gl_cache[k] = gl_lookup(s->name);
+        fn = gl_cache[k];
     } else {
         rt_fatal(c, "call to data export %08x (stub %08x)", s->impl, stub);
     }
