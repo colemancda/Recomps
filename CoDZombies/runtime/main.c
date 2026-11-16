@@ -1,0 +1,47 @@
+/* Runs the recompiled game: map guest memory, load the image, call the start routine.
+ *
+ *   codz [path/to/kiwi.app]
+ *
+ * Saves and other files the game writes go to $CODZ_SAVE (default: save/ in
+ * the directory it was started from).
+ *
+ * Environment: RT_LOG_IMPORTS=1 logs every import call; RT_MISSING=zero makes
+ * unimplemented imports return 0 instead of stopping.
+ */
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "rt.h"
+#include "funcs.h"
+
+#define START_ROUTINE 0x00065f00u   /* the s3e image's entry; the loader's only pointer into it */
+
+int main(int argc, char **argv) {
+    static char app[PATH_MAX], save[PATH_MAX];
+    if (!realpath(argc > 1 ? argv[1] : "orig/Payload/kiwi.app", app)) { perror("app directory"); return 1; }
+    const char *s = getenv("CODZ_SAVE");
+    if (!s) s = "save";
+    mkdir(s, 0755);
+    if (!realpath(s, save)) { perror(s); return 1; }
+    g_app_dir = app;
+    g_save_dir = save;
+    if (chdir(g_app_dir) != 0) { perror(g_app_dir); return 1; }
+
+    mem_init();
+    load_image("kiwi");
+    config_init();
+    imports_init();
+
+    static CPU cpu;
+    CPU *c = &cpu;
+    c->r[13] = GUEST_STACK_TOP;
+    c->r[14] = GUEST_SENTINEL;
+    c->excl_addr = 1;
+    rt_log("calling the start routine %08x", START_ROUTINE);
+    f_00065f00(c);
+    rt_log("start routine returned to %08x, r0 = %08x", c->r[15], c->r[0]);
+    return (int)c->r[0];
+}
