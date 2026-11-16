@@ -36,6 +36,20 @@ static DiDevice devices[16];
 static uint32_t vt_dinput, vt_device, dinput_obj;
 static pthread_mutex_t di_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* A raw key/button arrived: signal every DirectInput device's notification event
+ * so a game that waits on it (MsgWaitForMultipleObjects) wakes and reads
+ * GetDeviceData. MapleStory reads the login keystrokes exactly this way. */
+void rt_dinput_notify(void) {
+    pthread_mutex_lock(&di_mu);
+    for (int i = 0; i < 16; i++) {
+        if (devices[i].used && devices[i].event) {
+            RtWaitable *w = rt_handle_get(devices[i].event, RT_H_WAITABLE);
+            if (w) rt_waitable_signal(w);
+        }
+    }
+    pthread_mutex_unlock(&di_mu);
+}
+
 static const uint8_t GUID_SysMouse[16] = {0x60, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11,
                                            0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00};
 static const uint8_t GUID_SysKeyboard[16] = {0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11,

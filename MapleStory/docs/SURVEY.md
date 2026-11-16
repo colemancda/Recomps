@@ -328,3 +328,42 @@ lifted CLogin / UIWindow child-draw (visibility) logic and needs deeper
 recompiled-code debugging. The retail client under Wine (same handshake-only mock,
 GameGuard bypassed with a stub npkcrypt.dll) draws them all, confirming the data
 and the server interaction are sufficient — the gap is ours.
+
+## Login input: the message pump now runs, but clicks don't focus a field
+
+Reaching the login screen, the remaining blocker is driving input (type the ID /
+password, click Log in). Traced the client's input architecture end to end:
+
+- MapleStory does **not** read the keyboard through DirectInput (no
+  `SetEventNotification` / `GetDeviceState` / `GetDeviceData` is ever called) and
+  does **not** read the mouse through DirectInput either.
+- Its main loop at `0x8264a7` drives everything off `MsgWaitForMultipleObjects`
+  (the IAT slot `[0x97b5e4]`, resolved via `GetProcAddress`): it waits on 3 event
+  handles with `dwWakeMask = QS_ALLINPUT`, and only when the call returns
+  `WAIT_OBJECT_0 + nCount` (input available) does it run the Win32 pump —
+  `PeekMessageA` (`[0x97b5e0]`), `TranslateMessage` (`[0x97b528]`),
+  `DispatchMessageA` (`[0x97b524]`).
+
+The runtime's `MsgWaitForMultipleObjects` stub always returned `WAIT_TIMEOUT`, so
+the pump never ran and keystrokes never reached the window procedure. Fixed: it
+now polls the wait handles and, when an input event is queued
+(`rt_input_pending()`) and the caller asked for input, returns
+`WAIT_OBJECT_0 + nCount`. With that, `PeekMessage`/`Translate`/`Dispatch` go from
+~2 calls total to pumping every queued event, and a typed `WM_CHAR` reaches the
+window procedure at `0x82c96c` with the correct character.
+
+The window procedure routes a printable `WM_CHAR` (via the message pre-filter
+`FUN_0081a94a`, gated on `[0x978364]`, which is set) to
+`FUN_0081b1a4`, which delivers the character to the **focused input field** at
+`[uiManager + 0x80]` (uiManager = `[0x9784c0]`). That field pointer is **null** —
+no field is focused — so the character is dropped.
+
+A field is focused by clicking it, and clicks do **not** focus it: the mouse
+button reaches the game (`GetAsyncKeyState(VK_LBUTTON)` returns pressed at the
+click frame, confirmed in-trace) and the cursor position is correct
+(`GetCursorPos`, identity `ScreenToClient`, cursor renders over the field), yet
+`[uiManager + 0x80]` stays null for clicks anywhere over the ID / Password fields.
+So the input plumbing is complete up to the window procedure; the gap is the same
+as the missing login buttons — the lifted CLogin / UIWindow hit-test & focus logic
+does not register the click. Needs recompiled-code debugging of CLogin's mouse
+handling, not more runtime input work.

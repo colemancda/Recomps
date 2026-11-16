@@ -65,6 +65,10 @@ extern const unsigned rt_nimages;
 #define TEB_SIZE        0x1000u
 
 /* ---- memory (mem.c); the allocators are thread safe ---- */
+uint32_t rt_wait_handles(CPU *c, uint32_t handles, uint32_t n, int wait_all, uint32_t ms);
+int rt_input_pending(void);
+void rt_dinput_notify(void); /* signal DirectInput device events when raw input arrives */
+void rt_ll_kbd_queue(int vk, int scan, int down); /* queue a key for the WH_KEYBOARD_LL hook */
 void rt_mem_init(void);
 void rt_mem_commit(uint32_t addr, uint32_t size); /* make [addr, addr+size) read/write */
 /* Map the first `size` bytes of the open file `fd` into the guest's file-mapping

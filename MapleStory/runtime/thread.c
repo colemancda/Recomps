@@ -503,6 +503,19 @@ H(k32_WaitForMultipleObjects) {
     return wait_many(c, ws, n, a[2] != 0, a[3]);
 }
 
+/* For MsgWaitForMultipleObjects: wait on an array of guest handles like
+ * WaitForMultipleObjects (ms=0 polls). Returns WAIT_OBJECT_0+i, or 0x102 on
+ * timeout / a bad handle. */
+uint32_t rt_wait_handles(CPU *c, uint32_t handles, uint32_t n, int wait_all, uint32_t ms) {
+    RtWaitable *ws[64];
+    if (n == 0 || n > 64 || !handles) return 0x102u;
+    for (uint32_t i = 0; i < n; i++) {
+        ws[i] = rt_handle_get(ld32(handles + 4 * i), RT_H_WAITABLE);
+        if (!ws[i]) return 0x102u;
+    }
+    return wait_many(c, ws, n, wait_all, ms);
+}
+
 H(k32_CloseHandle) {
     if (rt_handle_close(a[0])) return 1;
     /* Pseudo handles and handles of object types the runtime does not track. */

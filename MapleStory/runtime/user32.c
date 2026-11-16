@@ -647,6 +647,7 @@ H(user_ShowWindow) {
     int top = is_top_level_game_window(w);
     char title[128];
     snprintf(title, sizeof title, "%s", w->text);
+    int ww = w->w, hh = w->h; /* the game's own window size (= client area for its popup window) */
     if (top && show && !main_hwnd) main_hwnd = a[0];
     int is_main = main_hwnd == a[0];
     pthread_mutex_unlock(&user_mu);
@@ -655,6 +656,10 @@ H(user_ShowWindow) {
         if (!send_message(c, a[0], WM_SHOWWINDOW, (uint32_t)show, 0, &r)) return 0;
     }
     if (is_main && show) {
+        /* Use the game's own window size for the screen, so input, GetClientRect
+         * and the render target all share one coordinate space (MapleStory lays
+         * its UI out at 800x600, not the 640x480 default). */
+        if (ww >= 320 && hh >= 240) { screen_w = ww; screen_h = hh; }
         rt_video_open(title, SCREEN_W, SCREEN_H);
         activate_window(c, a[0]);
         if (c->eip == RT_NL_PENDING) return 0;

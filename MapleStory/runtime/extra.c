@@ -3,10 +3,66 @@
  * faults when called, so these are provided here. Correctness-sensitive ones
  * (RECT maths, file mapping) are real; the rest are benign stubs that let the
  * client proceed, to be fleshed out when their effect is reached. */
+#include <pthread.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "com.h"
 #include "rt.h"
+
+/* ------------------------------------------------------------- keyboard hook
+ * MapleStory reads the login fields' keystrokes through a WH_KEYBOARD_LL hook
+ * (also its anti-keylogger), not through the message queue or polling. Deliver
+ * key events to the installed hook on the guest's main thread, from the per-frame
+ * MsgWaitForMultipleObjects. */
+static uint32_t ll_kbd_hook;
+static pthread_mutex_t ll_mu = PTHREAD_MUTEX_INITIALIZER;
+#define LL_Q 128
+static struct { uint16_t vk, scan; uint8_t up; } ll_q[LL_Q];
+static int ll_head, ll_tail;
+
+void rt_ll_kbd_queue(int vk, int scan, int down) {
+    if (getenv("RECOMP_TRACE_KEY")) rt_log("[llkbd] queue vk=%d scan=%d down=%d hook=%x\n", vk, scan, down, ll_kbd_hook);
+    pthread_mutex_lock(&ll_mu);
+    if (ll_kbd_hook) {
+        int n = (ll_tail + 1) % LL_Q;
+        if (n != ll_head) {
+            ll_q[ll_tail].vk = (uint16_t)vk;
+            ll_q[ll_tail].scan = (uint16_t)scan;
+            ll_q[ll_tail].up = (uint8_t)!down;
+            ll_tail = n;
+        }
+    }
+    pthread_mutex_unlock(&ll_mu);
+}
+
+static int ll_flush_logged;
+static void ll_kbd_flush(CPU *c) {
+    if (getenv("RECOMP_TRACE_KEY") && !ll_flush_logged) { ll_flush_logged = 1; rt_log("[llkbd] flush called, hook=%x head=%d tail=%d\n", ll_kbd_hook, ll_head, ll_tail); }
+    if (!ll_kbd_hook) return;
+    for (;;) {
+        pthread_mutex_lock(&ll_mu);
+        if (ll_head == ll_tail) { pthread_mutex_unlock(&ll_mu); return; }
+        uint16_t vk = ll_q[ll_head].vk, scan = ll_q[ll_head].scan;
+        uint8_t up = ll_q[ll_head].up;
+        ll_head = (ll_head + 1) % LL_Q;
+        pthread_mutex_unlock(&ll_mu);
+        uint32_t sp = ESP;
+        uint32_t s = rt_stack_alloc(c, 32); /* KBDLLHOOKSTRUCT */
+        st32(s + 0, vk);                    /* vkCode */
+        st32(s + 4, scan);                  /* scanCode */
+        st32(s + 8, up ? 0x80u : 0u);       /* flags: LLKHF_UP */
+        st32(s + 12, 0);                    /* time */
+        st32(s + 16, 0);                    /* dwExtraInfo */
+        uint32_t args[3] = {0u /* HC_ACTION */, up ? 0x101u /* WM_KEYUP */ : 0x100u /* WM_KEYDOWN */, s};
+        uint32_t r = 0;
+        if (getenv("RECOMP_TRACE_KEY")) rt_log("[llkbd] hook %x vk=%u scan=%u up=%u\n", ll_kbd_hook, vk, scan, up);
+        rt_call_guest(c, ll_kbd_hook, RT_STDCALL, 3, args, &r);
+        if (getenv("RECOMP_TRACE_KEY")) rt_log("[llkbd] -> %u\n", r);
+        ESP = sp;
+    }
+}
 
 /* ------------------------------------------------------------------ user32: RECT */
 /* A RECT is four int32: left, top, right, bottom. */
@@ -52,10 +108,33 @@ H(ex_DrawTextA) {
 }
 /* Windows hooks: accepted but never fire (no WH_* hooks in a headless/one-window
  * client that matters at boot). CallNextHookEx passes through. */
-H(ex_SetWindowsHookEx) { UNUSED; return 0xC0DE0100u; }
-H(ex_UnhookWindowsHookEx) { UNUSED; return 1; }
+H(ex_SetWindowsHookEx) {
+    UNUSED; /* (idHook, lpfn, hmod, dwThreadId) */
+    if (a[0] == 13 || a[0] == 2) ll_kbd_hook = a[1]; /* WH_KEYBOARD_LL / WH_KEYBOARD */
+    if (getenv("RECOMP_TRACE_KEY")) rt_log("[llkbd] SetWindowsHookEx id=%u proc=%x -> stored=%x\n", a[0], a[1], ll_kbd_hook);
+    return 0xC0DE0100u + a[0];
+}
+H(ex_UnhookWindowsHookEx) {
+    UNUSED;
+    if (a[0] == 0xC0DE0100u + 13 || a[0] == 0xC0DE0100u + 2) ll_kbd_hook = 0;
+    return 1;
+}
 H(ex_CallNextHookEx) { UNUSED; return 0; }
-H(ex_MsgWaitForMultipleObjects) { UNUSED; return 0x102; } /* WAIT_TIMEOUT */
+H(ex_MsgWaitForMultipleObjects) {
+    UNUSED; /* (nCount, pHandles, fWaitAll, dwMilliseconds, dwWakeMask) */
+    ll_kbd_flush(c); /* let the keyboard hook see the keys (it blocks Win/Esc) */
+    /* A signaled wait handle wins first. */
+    if (a[0] > 0) {
+        uint32_t r = rt_wait_handles(c, a[1], a[0], (int)a[2], 0);
+        if (r != 0x102u) return r;
+    }
+    /* If input is queued and the caller wants input events (dwWakeMask != 0),
+     * report WAIT_OBJECT_0 + nCount so the game pumps its message loop
+     * (PeekMessage -> TranslateMessage -> DispatchMessage). This is how
+     * MapleStory's main loop learns a keystroke or click is waiting. */
+    if (a[4] && rt_input_pending()) return a[0];
+    return 0x102; /* WAIT_TIMEOUT */
+}
 
 /* ------------------------------------------------------------------ kernel32: file mapping */
 /* CreateFileMappingA/MapViewOfFile live in file.c (they need the file layer to

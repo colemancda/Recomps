@@ -88,6 +88,7 @@ int rt_input_read(unsigned *cursor, RtRawInput *out, int *overflow) {
  * event that user32 turns into a window message. Video thread only. */
 static RtInputEvent pending[64];
 static int npending;
+int rt_input_pending(void) { return npending > 0; } /* a queued input event is waiting for the game to pump */
 
 static void queue_event(const RtInputEvent *ev) {
     if (npending < (int)RT_COUNTOF(pending)) pending[npending++] = *ev;
@@ -143,6 +144,8 @@ static void input_key(int vk, int dik, int down, int repeat) {
         rt_dik_state[ev.scan] = 0;
     }
     if (!repeat) raw_push(RT_RAW_KEY, ev.scan, down ? 0x80 : 0);
+    rt_ll_kbd_queue(ev.code, ev.scan, down); /* feed MapleStory's WH_KEYBOARD_LL hook */
+    rt_dinput_notify();                         /* wake a DirectInput waiter */
     queue_event(&ev);
 }
 
@@ -1133,7 +1136,17 @@ void rt_video_present(const void *pixels, int width, int height, int pitch, int 
     if (dump && g_opt.dump_window && have_window) window_dump_at = n;
 #endif
     pthread_mutex_unlock(&frame_mu);
-    if (rt_video_on_video_thread()) flush_frame();
+    if (rt_video_on_video_thread()) {
+        /* Drive the input script from the present loop too: a game that polls its
+         * input (MapleStory reads DirectInput / a keyboard hook / GetCursorPos)
+         * instead of pumping window messages never reaches rt_video_poll, so the
+         * script's side effects (mouse/key state, the keyboard-hook queue) would
+         * otherwise never be applied. Steps advance monotonically, so also running
+         * it here does not re-fire them. Unconsumed queue entries are dropped so a
+         * non-pumping game cannot stall the script at the queue cap. */
+        if (g_opt.input_script[0]) script_run();
+        flush_frame();
+    }
     if (g_opt.exit_after_frame > 0 && n >= (unsigned)g_opt.exit_after_frame) {
         rt_log("\nrecomp: stopping after %u presented frames (--frames)\n", n);
         rt_print_import_stats();
