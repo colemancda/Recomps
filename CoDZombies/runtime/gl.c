@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <TargetConditionals.h>
+
 #include "rt.h"
 
 #define NATIVE_WINDOW 0xau
@@ -33,6 +35,24 @@
 #define EGL_BAD_SURFACE   0x300d
 #define EGL_BAD_PARAMETER 0x300c
 #define EGL_NONE          0x3038
+
+/* gl_real.c */
+extern int g_gl_real;
+ImportFn gl_real_lookup(const char *name);
+void gl_real_make_current(void);
+void gl_real_swap(uint32_t frame);
+
+static void gl_backend_init(void) {
+    static int done;
+    if (done++) return;
+#if TARGET_OS_IPHONE
+    g_gl_real = 1;
+#else
+    const char *e = getenv("RT_GL");
+    g_gl_real = e && *e && strcmp(e, "0");
+#endif
+    rt_log("GL backend: %s", g_gl_real ? "real" : "null");
+}
 
 static uint32_t egl_error = EGL_SUCCESS;
 static uint32_t current_context;
@@ -136,6 +156,8 @@ static void eglDestroyContext(CPU *c) {
 static void eglMakeCurrent(CPU *c) {            /* (dpy, draw, read, ctx) */
     if (!egl_check_display(arg(c, 0))) { ret32(c, 0); return; }
     current_context = arg(c, 3);
+    gl_backend_init();
+    if (g_gl_real && current_context) gl_real_make_current();
     egl_true(c, 1);
 }
 static void eglGetCurrentContext(CPU *c) { ret32(c, current_context); }
@@ -159,6 +181,7 @@ static void eglSwapBuffers(CPU *c) {            /* (dpy, surface) */
     static uint32_t frames;
     if (!egl_check_display(arg(c, 0)) || arg(c, 1) != SURFACE) { ret32(c, 0); return; }
     if (++frames <= 3 || frames % 600 == 0) rt_log("eglSwapBuffers: frame %u", frames);
+    if (g_gl_real) gl_real_swap(frames);
     egl_true(c, 1);
 }
 /* (name): the stub of the GL import of that name, with any OES suffix dropped
@@ -204,7 +227,7 @@ static uint32_t gl_string(uint32_t name) {
 /* 0x47e40: the loader's glGetString wrapper. */
 static void glGetString_(CPU *c) { ret32(c, gl_string(arg(c, 0))); }
 
-static uint32_t gl_bound_texture, gl_viewport[4] = {0, 0, 320, 480};
+static uint32_t gl_bound_texture, gl_viewport[4] = {0, 0, SCREEN_W, SCREEN_H};
 
 static int gl_integer(uint32_t pname, int32_t *v) {
     switch (pname) {
@@ -308,8 +331,15 @@ static int log_gl = -1;
 #define GL_NULL_LOGGED 1024
 static const char *null_logged[GL_NULL_LOGGED];
 
+/* The real backend draws what it can and the queries keep the iPhone's
+ * answers, so the game takes the same paths either way. */
 ImportFn gl_lookup(const char *name) {
     if (log_gl < 0) log_gl = getenv("RT_LOG_GL") != NULL;
+    gl_backend_init();
+    if (g_gl_real) {
+        ImportFn f = gl_real_lookup(name);
+        if (f) return f;
+    }
     for (size_t k = 0; k < sizeof gl_fns / sizeof gl_fns[0]; k++)
         if (!strcmp(gl_fns[k].name, name)) return gl_fns[k].fn;
     if (log_gl) {
