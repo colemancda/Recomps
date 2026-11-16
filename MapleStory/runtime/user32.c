@@ -1406,7 +1406,9 @@ H(user_PtInRect) {
     UNUSED;
     int32_t v[4], x = (int32_t)a[1], y = (int32_t)a[2];
     rect_get(a[0], v);
-    return x >= v[0] && x < v[2] && y >= v[1] && y < v[3];
+    int r = x >= v[0] && x < v[2] && y >= v[1] && y < v[3];
+    if (getenv("RECOMP_TRACE_HIT")) rt_log("[hit] pt=%d,%d rect={%d,%d,%d,%d} -> %d\n", x, y, v[0], v[1], v[2], v[3], r);
+    return r;
 }
 H(user_OffsetRect) {
     UNUSED;

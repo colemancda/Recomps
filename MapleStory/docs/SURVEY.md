@@ -358,12 +358,27 @@ The window procedure routes a printable `WM_CHAR` (via the message pre-filter
 `[uiManager + 0x80]` (uiManager = `[0x9784c0]`). That field pointer is **null** —
 no field is focused — so the character is dropped.
 
-A field is focused by clicking it, and clicks do **not** focus it: the mouse
-button reaches the game (`GetAsyncKeyState(VK_LBUTTON)` returns pressed at the
-click frame, confirmed in-trace) and the cursor position is correct
-(`GetCursorPos`, identity `ScreenToClient`, cursor renders over the field), yet
-`[uiManager + 0x80]` stays null for clicks anywhere over the ID / Password fields.
-So the input plumbing is complete up to the window procedure; the gap is the same
-as the missing login buttons — the lifted CLogin / UIWindow hit-test & focus logic
-does not register the click. Needs recompiled-code debugging of CLogin's mouse
-handling, not more runtime input work.
+A field is focused by clicking it, and clicks do **not** focus it. The input
+reaches the game correctly:
+
+- the mouse button is seen — `GetAsyncKeyState(VK_LBUTTON)` returns pressed at the
+  click frame (via the `IsKeyPressed` helper `FUN_005265f8`, confirmed in-trace);
+- the cursor position is right — `GetCursorPos` with identity `ScreenToClient`,
+  and the cursor renders over the field;
+- the hit-test runs and **finds the field** — the per-control test `FUN_004b3b5d`
+  (`PtInRect` against the control's `{0,0,w,h}` in local coords, called from the
+  recursive find-control-at-point `FUN_0049e625`) returns a hit for a control of
+  size `132x15` at screen `~449,240`, i.e. the Login ID field, when clicking it.
+
+So the click is seen, positioned correctly, and hit-tests onto the ID field — yet
+`[uiManager + 0x80]` (the focused field) stays null and no `OnMouseDown`/focus
+action fires. The gap is between "control under the cursor is found" and "that
+control is told it was pressed," inside the lifted UI event-dispatch (the
+recursive coordinate-transform traversal through vtable slots 0x18 / 0x2c / 0x30).
+This is the same root as the missing login buttons: the recompiled CLogin /
+UIWindow event + child-draw logic only partly works. Both need deeper
+recompiled-code debugging of that traversal, not more runtime input work.
+
+Runtime trace knobs added for this: `RECOMP_TRACE_HIT` (every `PtInRect` with its
+rect, point and result) and `RECOMP_TRACE_FOCUS` (the focused-field pointer on
+change).
