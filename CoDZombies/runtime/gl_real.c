@@ -62,8 +62,16 @@ static GLuint fbo;
 static int width = SCREEN_W, height = SCREEN_H;
 #endif
 
+#if !GL_DESKTOP
+/* ios/app.m: the EAGL context and the layer's framebuffer */
+void ios_gl_make_current(void);
+void ios_gl_present(void);
+#endif
+
 void gl_real_make_current(void) {
-#if GL_DESKTOP
+#if !GL_DESKTOP
+    ios_gl_make_current();
+#else
     if (ctx) return;
     CGLPixelFormatAttribute attrs[] = {kCGLPFAAccelerated, kCGLPFAColorSize, 24, kCGLPFADepthSize, 24,
                                        kCGLPFAStencilSize, 8, 0};
@@ -147,6 +155,7 @@ void gl_real_swap(uint32_t frame) {
     }
 #else
     (void)frame;
+    ios_gl_present();
 #endif
 }
 
