@@ -382,3 +382,42 @@ recompiled-code debugging of that traversal, not more runtime input work.
 Runtime trace knobs added for this: `RECOMP_TRACE_HIT` (every `PtInRect` with its
 rect, point and result) and `RECOMP_TRACE_FOCUS` (the focused-field pointer on
 change).
+
+## Correction: login text input actually works — the blockers are render + a crash
+
+The section above concluded clicks don't focus a field and chars are dropped.
+That was a misread: the focus pointer is read from `[0x978364] + 0x80` (the
+message-filter object that `FUN_0081a94a` passes to `FUN_0081b1a4`), **not**
+`[0x9784c0] + 0x80` (a different object, which does stay null). Tracing the real
+one shows the client **auto-focuses the Login ID field** on entry and delivers
+typed chars correctly:
+
+- `FUN_0081b1a4` reads `[this+0x80]` (= the focused `CInputString`, e.g. the ID
+  field inner object at control+4) and calls its `OnChar` vtbl[0x3c] =
+  `FUN_004a0bc9` with the right character.
+- `FUN_004a0bc9` inserts the char into the field's string (via `FUN_0045f0f3`).
+  Dumping the field object after typing `ABCDE` shows the string buffer at
+  `[field+0x34]` grow `A → AB → ABC → ABCD → ABCDE`. **The text is stored.**
+
+So two real blockers remain, both in lifted code, both the same class as the
+missing login buttons:
+
+1. **Render:** the field stores its text but never draws it (and the aux buttons
+   load but never draw). Cosmetic, but it's why the screen looks empty.
+2. **Focus switch between fields:** the *default* focus works, but a click on a
+   different field doesn't move focus (the UI click→focus dispatch, traced
+   earlier, finds the control but never fires its press). A local demo hook
+   (`RECOMP_LOGIN_INJECT`, in gitignored `build/gen`) that forces
+   `[0x978364]+0x80` to the hovered field proves both ID and Password fill
+   correctly (`USER` into the ID field, `PASS` into the Password field, by object
+   address).
+3. **Submit crash:** with both fields filled, pressing Enter triggers the login
+   path (GetAsyncKeyState/Dispatch activity jumps, IME fires) but crashes in a
+   `shape2d.dll` infinite recursion (`FUN_51406cf7` descent through an `atan2`,
+   stack overflow) during the post-submit transition — before the login packet
+   reaches the server. A separate deep lifted-engine bug, probably fed degenerate
+   geometry from the same UI-init problem.
+
+Net: the credential **input path works end to end up to submit** (proven by the
+stored field strings). Reaching character select needs the shape2d transition
+crash fixed (and, for a visible demo, the field/button render).
