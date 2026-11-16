@@ -497,3 +497,46 @@ Caveat unchanged: filling the Password field and submitting still use the local
 click→focus dispatch and the field/button text render are still the open
 lifted-code bugs. Next: select a channel (needs the same click fix) → character
 list / world entry.
+
+## Full pre-game flow works: login → world → channel → character select
+
+With real clicks (no injection hook) the recompiled GMS v62 client now walks the
+entire pre-game flow against `MapleStoryServer62`:
+
+```
+loginRequest  -> success        (type ID, click the Password field, type, Enter)
+afterLogin    -> success
+serverListRequest -> world "Scania" + 20 channels
+  (click the Scania world slot; the channel grid CH.1..CH.20 renders)
+serverStatusRequest -> Server Status World 0 Channel 0
+characterListRequest -> CharacterListResponse(characters: [], maxCharacters: 9)
+  (click CH.1, click "Enter Channel")
+```
+
+The client then renders the **character-select screen** ("Select a character",
+"Selected world: SCANIA, CH. CHANNEL 1"), loading the empty character list for
+the new account. Clean exit, no crash.
+
+Two corrections/fixes made this work:
+
+1. **Clicks were never broken.** The earlier "click→focus dispatch is broken"
+   finding was a misread of the focus pointer (I logged `[0x9784c0]+0x80`, but the
+   char path reads `[0x978364]+0x80`). Clicking the Password field *does* move
+   focus; login succeeds with no injection. The login-screen text just isn't
+   *rendered* (a cosmetic bug local to that screen; the channel grid and character
+   screen render fine). Note: world/channel controls are sampled sparsely, so
+   synthetic clicks need a long button hold (down, hold ~25 frames, up) to land.
+
+2. **Lifter missed vtable-only `__thiscall` methods.** Selecting a channel crashed
+   calling a virtual method whose vtable slot pointed at `0x5797eb` — a 13-byte
+   function (`push ecx; mov ecx,[ecx+0xCC]; call ...; ret`) right after another
+   function's `ret`, reached only through the vtable. `tools/data_code_pointers.py`
+   rejected it because its `PROLOGUES` set lacked the push-reg opcodes; `push ecx`
+   (0x51) is a very common MSVC "reserve one local" prologue. Added 0x50–0x54 to
+   the set (+138 data-pointer functions total) and re-lifted; the method is now a
+   real entry and the crash is gone. This fixes the whole class of missed
+   vtable-only methods, not just this one.
+
+Remaining: the empty character list shows "Connecting to server" then empty slots;
+character *creation* and world entry are the next steps. The login-screen text
+render is still open (cosmetic).

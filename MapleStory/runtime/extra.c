@@ -123,6 +123,7 @@ H(ex_CallNextHookEx) { UNUSED; return 0; }
 H(ex_MsgWaitForMultipleObjects) {
     UNUSED; /* (nCount, pHandles, fWaitAll, dwMilliseconds, dwWakeMask) */
     ll_kbd_flush(c); /* let the keyboard hook see the keys (it blocks Win/Esc) */
+    if (getenv("RECOMP_TRACE_FOCUS")) { static uint32_t pf=0xbad; uint32_t f=ld32(0x978364u); uint32_t fld=f?ld32(f+0x80u):0; if (fld!=pf){pf=fld; rt_log("[focus2] focusedField=%x\n", fld);} }
     if (getenv("RECOMP_TRACE_FOCUS")) { static uint32_t pf=0xbad; uint32_t uim=ld32(0x9784c0u); uint32_t f=uim?ld32(uim+0x80u):0; if (f!=pf){pf=f; rt_log("[focus] focusedField=%x\n", f);} }
     /* A signaled wait handle wins first. */
     if (a[0] > 0) {
