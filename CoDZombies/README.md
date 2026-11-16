@@ -48,7 +48,8 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   decompression, plus the loader's dummy EGL. Its GL backend draws through
   desktop GL offscreen (`RT_GL=1`, frames saved with `RT_GL_DUMP`): the game
   shows its splash screens, the menus and, with scripted taps (`RT_TAPS`), a
-  level of Nacht der Untoten played through to "Game Over".
+  level of Nacht der Untoten played through to "Game Over", with sound (the
+  game's IwSound callbacks mixed into an AudioQueue).
 - `./build.sh sim` builds an arm64 iOS app (`ios/`) that runs the game in the
   iOS Simulator, driven by touch from the title screen into a level.
   `./build.sh ios` builds the device app (not yet run on a device).
