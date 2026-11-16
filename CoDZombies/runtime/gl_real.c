@@ -150,10 +150,75 @@ void gl_real_swap(uint32_t frame) {
 #endif
 }
 
+/* -------------------------------------------------------- buffer objects */
+/* The game puts level geometry in buffer objects. Each keeps a host copy of
+ * its contents, for the GL_FIXED conversion and for reading indices. */
+typedef struct { uint8_t *data; uint32_t size; } Buf;
+static Buf *bufs;
+static uint32_t nbufs;
+static uint32_t bound_array, bound_element;   /* glBindBuffer */
+
+static Buf *buf_of(uint32_t name) {
+    if (!name) return NULL;
+    if (name >= nbufs) {
+        uint32_t n = name * 2 + 16;
+        bufs = realloc(bufs, sizeof(Buf) * n);
+        memset(bufs + nbufs, 0, sizeof(Buf) * (n - nbufs));
+        nbufs = n;
+    }
+    return &bufs[name];
+}
+static void glGenBuffers_(CPU *c) {
+    uint32_t n = A(0);
+    GLuint *t = calloc(n ? n : 1, sizeof(GLuint));
+    glGenBuffers((GLsizei)n, t);
+    for (uint32_t k = 0; k < n; k++) st32(A(1) + 4 * k, t[k]);
+    free(t);
+}
+static void glDeleteBuffers_(CPU *c) {
+    uint32_t n = A(0);
+    GLuint *t = calloc(n ? n : 1, sizeof(GLuint));
+    for (uint32_t k = 0; k < n; k++) {
+        t[k] = ld32(A(1) + 4 * k);
+        Buf *b = buf_of(t[k]);
+        if (b) { free(b->data); b->data = NULL; b->size = 0; }
+        if (t[k] == bound_array) bound_array = 0;
+        if (t[k] == bound_element) bound_element = 0;
+    }
+    glDeleteBuffers((GLsizei)n, t);
+    free(t);
+}
+static void glBindBuffer_(CPU *c) {
+    if (A(0) == GL_ARRAY_BUFFER) bound_array = A(1);
+    else if (A(0) == GL_ELEMENT_ARRAY_BUFFER) bound_element = A(1);
+    glBindBuffer(A(0), A(1));
+}
+static Buf *bound_buf(uint32_t target) {
+    return buf_of(target == GL_ARRAY_BUFFER ? bound_array : target == GL_ELEMENT_ARRAY_BUFFER ? bound_element : 0);
+}
+static void glBufferData_(CPU *c) {   /* (target, size, data, usage) */
+    uint32_t size = A(1);
+    Buf *b = bound_buf(A(0));
+    if (b) {
+        b->data = realloc(b->data, size ? size : 1);
+        b->size = size;
+        if (A(2)) memcpy(b->data, G(A(2)), size);
+        else memset(b->data, 0, size);
+    }
+    glBufferData(A(0), (GLsizeiptr)size, P(A(2)), A(3));
+}
+static void glBufferSubData_(CPU *c) {   /* (target, offset, size, data) */
+    uint32_t off = A(1), size = A(2);
+    Buf *b = bound_buf(A(0));
+    if (b && off <= b->size && size <= b->size - off) memcpy(b->data + off, G(A(3)), size);
+    glBufferSubData(A(0), (GLintptr)off, (GLsizeiptr)size, P(A(3)));
+}
+
 /* -------------------------------------------------------- client arrays */
-/* Arrays as the game set them. Desktop GL gets GL_FIXED ones converted at draw
- * time; everything else goes straight through. */
-typedef struct { GLint size; GLenum type; GLsizei stride; uint32_t ptr; } Array;
+/* Arrays as the game set them: ptr is a guest address, or an offset into
+ * buffer buf when one was bound. Desktop GL gets GL_FIXED ones converted at
+ * draw time; everything else goes straight through. */
+typedef struct { GLint size; GLenum type; GLsizei stride; uint32_t ptr, buf; } Array;
 enum { ARR_VERTEX, ARR_NORMAL, ARR_COLOR, ARR_TEX0, ARR_TEX1, ARR_N };
 static Array arrays[ARR_N];
 static int client_unit;   /* glClientActiveTexture */
@@ -166,7 +231,7 @@ static void set_array(int k) {
     Array *a = &arrays[k];
     GLenum type = a->type;
     if (GL_DESKTOP && type == GL_FIXED) return;   /* converted at draw time */
-    void *p = P(a->ptr);
+    void *p = a->buf ? (void *)(uintptr_t)a->ptr : P(a->ptr);
     switch (k) {
     case ARR_VERTEX: glVertexPointer(a->size, type, a->stride, p); break;
     case ARR_NORMAL: glNormalPointer(type, a->stride, p); break;
@@ -175,13 +240,29 @@ static void set_array(int k) {
     }
 }
 
+#if GL_DESKTOP
+/* The bytes an array starts at, wherever they live. */
+static const uint8_t *array_bytes(const Array *a, uint32_t *avail) {
+    if (a->buf) {
+        Buf *b = buf_of(a->buf);
+        if (!b || !b->data || a->ptr >= b->size) { *avail = 0; return NULL; }
+        *avail = b->size - a->ptr;
+        return b->data + a->ptr;
+    }
+    *avail = 0xffffffffu - a->ptr;
+    return G(a->ptr);
+}
+#endif
+
 static void convert_fixed(uint32_t count) {
 #if GL_DESKTOP
+    int unbound = 0;
     for (int k = 0; k < ARR_N; k++) {
         Array *a = &arrays[k];
-        if (a->type != GL_FIXED || !a->ptr) continue;
+        if (a->type != GL_FIXED || (!a->ptr && !a->buf)) continue;
         int n = k == ARR_NORMAL ? 3 : a->size;
-        uint32_t stride = a->stride ? (uint32_t)a->stride : 4u * n;
+        uint32_t stride = a->stride ? (uint32_t)a->stride : 4u * n, avail;
+        const uint8_t *src = array_bytes(a, &avail);
         size_t need = (size_t)count * n;
         if (need > fixed_cap[k]) {
             fixed_cap[k] = need * 2;
@@ -189,7 +270,13 @@ static void convert_fixed(uint32_t count) {
         }
         float *out = fixed_buf[k];
         for (uint32_t v = 0; v < count; v++)
-            for (int j = 0; j < n; j++) out[v * n + j] = X(ld32(a->ptr + v * stride + 4 * j));
+            for (int j = 0; j < n; j++) {
+                uint32_t off = v * stride + 4 * j;
+                int32_t x = 0;
+                if (src && off + 4 <= avail) memcpy(&x, src + off, 4);
+                out[v * n + j] = (float)x / 65536.0f;
+            }
+        if (!unbound++) glBindBuffer(GL_ARRAY_BUFFER, 0);   /* the floats are client memory */
         switch (k) {
         case ARR_VERTEX: glVertexPointer(n, GL_FLOAT, 0, out); break;
         case ARR_NORMAL: glNormalPointer(GL_FLOAT, 0, out); break;
@@ -201,6 +288,7 @@ static void convert_fixed(uint32_t count) {
             break;
         }
     }
+    if (unbound) glBindBuffer(GL_ARRAY_BUFFER, bound_array);
 #else
     (void)count;
 #endif
@@ -209,18 +297,17 @@ static void convert_fixed(uint32_t count) {
 static int any_fixed(void) {
     if (!GL_DESKTOP) return 0;
     for (int k = 0; k < ARR_N; k++)
-        if (arrays[k].type == GL_FIXED && arrays[k].ptr) return 1;
+        if (arrays[k].type == GL_FIXED && (arrays[k].ptr || arrays[k].buf)) return 1;
     return 0;
 }
 
-static void glVertexPointer_(CPU *c) { arrays[ARR_VERTEX] = (Array){(GLint)A(0), A(1), (GLsizei)A(2), A(3)}; set_array(ARR_VERTEX); }
-static void glNormalPointer_(CPU *c) { arrays[ARR_NORMAL] = (Array){3, A(0), (GLsizei)A(1), A(2)}; set_array(ARR_NORMAL); }
-static void glColorPointer_(CPU *c) { arrays[ARR_COLOR] = (Array){(GLint)A(0), A(1), (GLsizei)A(2), A(3)}; set_array(ARR_COLOR); }
-static void glTexCoordPointer_(CPU *c) {
-    int k = ARR_TEX0 + (client_unit & 1);
-    arrays[k] = (Array){(GLint)A(0), A(1), (GLsizei)A(2), A(3)};
-    set_array(k);
-}
+#define SET(k, size, type, stride, ptr) \
+    do { arrays[k] = (Array){(GLint)(size), (type), (GLsizei)(stride), (ptr), bound_array}; set_array(k); } while (0)
+static void glVertexPointer_(CPU *c) { SET(ARR_VERTEX, A(0), A(1), A(2), A(3)); }
+static void glNormalPointer_(CPU *c) { SET(ARR_NORMAL, 3, A(0), A(1), A(2)); }
+static void glColorPointer_(CPU *c) { SET(ARR_COLOR, A(0), A(1), A(2), A(3)); }
+static void glTexCoordPointer_(CPU *c) { SET(ARR_TEX0 + (client_unit & 1), A(0), A(1), A(2), A(3)); }
+#undef SET
 static void glClientActiveTexture_(CPU *c) { client_unit = (int)(A(0) - GL_TEXTURE0); glClientActiveTexture(A(0)); }
 
 static void glDrawArrays_(CPU *c) {   /* (mode, first, count) */
@@ -232,15 +319,18 @@ static void glDrawArrays_(CPU *c) {   /* (mode, first, count) */
 }
 static void glDrawElements_(CPU *c) { /* (mode, count, type, indices) */
     uint32_t count = A(1), type = A(2), ind = A(3);
+    Buf *eb = buf_of(bound_element);
     if (any_fixed()) {
-        uint32_t hi = 0;
-        for (uint32_t k = 0; k < count; k++) {
-            uint32_t v = type == GL_UNSIGNED_BYTE ? ld8(ind + k) : ld16(ind + 2 * k);
+        uint32_t hi = 0, esize = type == GL_UNSIGNED_BYTE ? 1 : 2;
+        const uint8_t *src = eb ? (eb->data && ind < eb->size ? eb->data + ind : NULL) : G(ind);
+        uint32_t avail = eb ? (src ? eb->size - ind : 0) : 0xffffffffu;
+        for (uint32_t k = 0; src && k < count && (k + 1) * esize <= avail; k++) {
+            uint32_t v = esize == 1 ? src[k] : (uint32_t)(src[2 * k] | src[2 * k + 1] << 8);
             if (v > hi) hi = v;
         }
         convert_fixed(hi + 1);
     }
-    glDrawElements(A(0), (GLsizei)count, type, P(ind));
+    glDrawElements(A(0), (GLsizei)count, type, eb ? (void *)(uintptr_t)ind : P(ind));
 }
 
 /* ------------------------------------------------------------- textures */
@@ -255,10 +345,23 @@ static void glTexImage2D_(CPU *c) {   /* (target, level, internal, w, h, border,
 static void glTexSubImage2D_(CPU *c) {   /* (target, level, x, y, w, h, format, type, pixels) */
     glTexSubImage2D(A(0), (GLint)A(1), (GLint)A(2), (GLint)A(3), (GLsizei)A(4), (GLsizei)A(5), A(6), A(7), P(A(8)));
 }
+void pvrtc_decode(const uint8_t *src, int w, int h, int two_bpp, uint8_t *out);   /* pvrtc.c */
+
 static void glCompressedTexImage2D_(CPU *c) {   /* (target, level, internal, w, h, border, size, data) */
 #if GL_DESKTOP
+    /* PVRTC (0x8c00 RGB 4bpp, 0x8c01 RGB 2bpp, 0x8c02 RGBA 4bpp, 0x8c03 RGBA 2bpp):
+     * decoded to RGBA8 here. Anything else is left empty. */
+    uint32_t fmt = A(2);
+    int w = (int)A(3), h = (int)A(4);
+    if (fmt >= 0x8c00 && fmt <= 0x8c03 && w > 0 && h > 0 && A(7)) {
+        uint8_t *px = malloc((size_t)w * h * 4);
+        pvrtc_decode(G(A(7)), w, h, fmt & 1, px);
+        glTexImage2D(A(0), (GLint)A(1), GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        free(px);
+        return;
+    }
     static int said;
-    if (!said++) rt_log("GL: compressed texture %#x has no desktop format; left empty", A(2));
+    if (!said++) rt_log("GL: compressed texture %#x has no desktop format; left empty", fmt);
 #else
     glCompressedTexImage2D(A(0), (GLint)A(1), A(2), (GLsizei)A(3), (GLsizei)A(4), (GLint)A(5), (GLsizei)A(6), P(A(7)));
 #endif
@@ -459,6 +562,7 @@ static void glMaterialfv_(CPU *c) {
 typedef struct { const char *name; ImportFn fn; } RealFn;
 static const RealFn real_fns[] = {
 #define R(n) {#n, n##_}
+    R(glGenBuffers), R(glDeleteBuffers), R(glBindBuffer), R(glBufferData), R(glBufferSubData),
     R(glVertexPointer), R(glNormalPointer), R(glColorPointer), R(glTexCoordPointer), R(glClientActiveTexture),
     R(glDrawArrays), R(glDrawElements),
     R(glTexImage2D), R(glTexSubImage2D), R(glCompressedTexImage2D), R(glGenTextures), R(glDeleteTextures),
