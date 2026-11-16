@@ -33,6 +33,10 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   `tools/s3e_boundary.py` lists all 809 import stubs with their calling
   convention. The game needs about 150 s3e functions and 98 OpenGL ES
   functions; see `docs/S3E_BOUNDARY.md`.
+- The loader calls back into the game through one routine (file systems for
+  the `.dz` archives, timers, device events), and r9 is an ordinary register.
+- `tools/s3e_survey.py` finds 15712 functions by recursive descent (85% ARM,
+  15% Thumb-1), covering 80% of the game code.
 - Not started yet: the ARM/Thumb lifter and the runtime.
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
