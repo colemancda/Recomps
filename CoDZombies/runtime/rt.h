@@ -71,6 +71,8 @@ extern const ImportImpl g_compress_impls[];  /* compress.c */
 extern const uint32_t g_compress_impl_count;
 extern const ImportImpl g_gl_impls[];        /* gl.c: s3eGL, EGL */
 extern const ImportImpl g_sound_impls[];     /* sound.c: s3eSound, s3eAudio */
+extern const ImportImpl g_input_impls[];     /* input.c: s3ePointer polling */
+extern const uint32_t g_input_impl_count;
 extern const uint32_t g_sound_impl_count;
 extern const uint32_t g_gl_impl_count;
 void imports_init(void);
@@ -88,10 +90,13 @@ static inline void ret64(CPU *c, uint64_t v) { c->r[0] = (uint32_t)v; c->r[1] = 
 /* Callbacks the game registered (s3e.c): calls each one for (device, id) as
  * fn(data, userdata). */
 void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data);
+int callbacks_registered(uint32_t device, uint32_t id);
 
 /* --------------------------------------------------------------- input */
-/* A pointer event, queued until the next s3eDeviceYield: kind 0 button
- * (pressed 1 or 0), 1 motion; screen coordinates. Any thread may call it. */
+/* A touch event, queued until the next s3eDeviceYield: touch id 0-9, kind 0
+ * press (pressed 1) or release (0), 1 motion; screen coordinates. Any thread
+ * may call it. input_pointer is touch 0. */
+void input_touch(int id, int kind, int pressed, int32_t x, int32_t y);
 void input_pointer(int kind, int pressed, int32_t x, int32_t y);
 void input_deliver(CPU *c);         /* s3eDeviceYield */
 void input_frame(uint32_t frame);   /* eglSwapBuffers: scripted taps (RT_TAPS) */
