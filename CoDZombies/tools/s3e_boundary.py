@@ -38,20 +38,25 @@ TRAMPOLINES = {
 }
 
 # Implementation address ranges in __text, by subsystem. Marmalade's sources are
-# linked in alphabetical order; each range is anchored by the strings its
-# functions use (assertion texts, config keys). Boundaries between anchors are
-# guesses.
+# linked in alphabetical order (the Disable<Subsystem> config keys list them all:
+# Accelerometer Audio Callbacks Camera Compression Config Crypto Debug Device
+# Error Ext Fibre File GL Keyboard License Memory Pointer SecureStorage Socket
+# Sound Surface Timer Vibra Video); each range is anchored by the strings its
+# functions use (assertion texts, config keys). Boundaries between anchors, and
+# names ending in "?", are guesses.
 SUBSYSTEMS = [
     (0x11400, "s3eAccelerometer"),
     (0x11A00, "s3eAudio"),
+    (0x12000, "bigint (internal)"),
+    (0x16F00, "s3eCallbacks"),
     (0x18400, "s3eCompression"),
     (0x19800, "s3eConfig"),
     (0x1C000, "s3eCrypto"),
-    (0x1DF00, "s3eDebug"),
-    (0x1FD00, "s3eDevice"),
+    (0x1DEA8, "s3eDebug"),
+    (0x1FD00, "s3eDevice/s3eError"),  # no string marks where Device ends
     (0x21D00, "s3eExt"),
     (0x23600, "s3eFile"),
-    (0x29A00, "s3eDevice(callbacks)"),
+    (0x29A00, "s3eGL?"),
     (0x2AC00, "s3eKeyboard"),
     (0x2D700, "s3eLicense"),
     (0x2DA00, "s3eMemory"),
