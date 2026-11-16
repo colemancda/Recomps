@@ -161,7 +161,7 @@ Bringing the game up exposed control flow the static passes had missed:
 | `0x29b54` | s3eFileAddUserFileSys | see "Asset archives" |
 | `0x189b0`, `0x18638`, `0x18424` | s3eCompressionDecompInit / Read / Final | see "Compression" |
 | `0x1f068` | s3eDeviceYield | clamps the ms argument, then runs the event loop; returns at once for now |
-| `0x398bc` | s3eSoundGetInt | volume 256, rates 22050, 16 channels, not available; a 0 rate made the game divide by zero |
+| `0x398bc` | s3eSurfaceGetInt | width, height, pitch, pixel types, device size, blit directions; see "Screen". First taken for s3eSoundGetInt, which made the screen 256×22050 |
 | `0x3a964` | timer function | 1 for 0, else a Timer error and −1 (`0x4fda0`) |
 | `0x1dea8`, `0x1deb0` | compiled-out debug checks | 0 |
 | `0x3ae20` | s3eTimerGetMs | 64-bit |
@@ -170,7 +170,7 @@ Bringing the game up exposed control flow the static passes had missed:
 | `0x21c98` | s3eExtGet | every extension unavailable |
 | `0x170fc`, `0x171ec`, `0x2fe2c`, `0x45b54` | callback registration | the generic registry `0x16e3c`/`0x17054(device, kind, id, fn, userdata)` for devices 13, 2, 6 (the pointer range) and 24 |
 | `0x1e068` | s3eDebugErrorShow | logged; continues |
-| `0x39c3c` | s3eSurfacePtr | 320×480 RGB565 |
+| `0x39c3c` | s3eSurfacePtr | 480×320 RGB565 |
 | `0x39c6c` | s3eSurfaceSetup | pixel type `0x422` |
 | `0x2aafc` | s3eGLGetInt | 0: GL version `0x101`, 1: EGL version `0x103`; IwGx takes the hardware path when the GL version is above `0xff` |
 | `0x2ab4c` | s3eGLGetNativeWindow | `0xa` |
@@ -196,12 +196,41 @@ GLES 2 framebuffer names (`glBindFramebuffer`); the game asks
 `eglGetProcAddress` for the OES ones, which get the stub of the name without
 `OES`.
 
-The host build has a null GL backend. Queries get the original iPhone's
-answers (PowerVR MBX, OpenGL ES-CM 1.1, its extension list, PVRTC formats,
-1024 textures, 5/6/5 colour, 24-bit depth), names count up, shader and program
-status is always success, and everything else does nothing. `RT_LOG_GL=1` logs
-the first call of each function that does nothing. `dispatch.c` looks each GL
-stub up once and keeps the answer.
+There are two GL backends. The queries (`glGetString`, `glGetIntegerv`,
+`glGetBooleanv`, `glGetError`) keep the original iPhone's answers in both
+(PowerVR MBX, OpenGL ES-CM 1.1, its extension list, PVRTC formats, 1024
+textures, 5/6/5 colour, 24-bit depth), so the game takes the same paths either
+way. `dispatch.c` looks each GL stub up once and keeps the answer.
+
+- **Null** (the host default): names count up, shader and program status is
+  always success, and everything else does nothing. `RT_LOG_GL=1` logs the
+  first call of each function that does nothing. Discovery runs use it.
+- **Real** (`runtime/gl_real.c`; `RT_GL=1` on the host, always on iOS): the
+  calls go to a real GL. On iOS that is OpenGL ES 1.1. On the Mac it is the
+  legacy desktop GL (2.1, on Metal) in an offscreen CGL context with a
+  480×320 framebuffer object, made at eglMakeCurrent. `RT_GL_DUMP=n` saves
+  every nth frame as a PNG in `build/frames` (or `RT_GL_DUMP_DIR`).
+
+On the way, floats arrive in core registers (softfp), 16.16 fixed point
+becomes float, pointers are guest addresses (`G()`), and the enum-valued
+`x` parameters (`glTexEnvx` modes, `glFogx(GL_FOG_MODE)`,
+`glTexParameterx`) pass as they are. Desktop GL has no `GL_FIXED` client
+arrays, and the game's vertex positions are fixed point (3 × `GL_FIXED`,
+stride 20): those are converted to float at each draw, over the index range
+the draw uses. Texture coordinates are `GL_SHORT`, colours bytes, indices
+16-bit, textures RGB and RGBA (bytes or 4444); the game uses no buffer
+objects. Compressed (PVRTC) textures have no desktop format and are left
+empty on the Mac; none have appeared yet.
+
+## Screen
+
+The game is landscape only (`UIInterfaceOrientationLandscapeRight`). On the
+iPhone the loader reported the portrait 320×480 device, and IwGx turned its
+picture by `([+0x224] − property 11) mod 4` quarter turns (`0x169988`, from
+s3eSurfaceGetInt's device blit direction). We report a 480×320 surface that
+needs no turning and draw into a 480×320 framebuffer, which is what a
+landscape view gives on iOS today. `SCREEN_W` and `SCREEN_H` in `rt.h` hold
+the size.
 
 ## Where it stands
 
@@ -221,8 +250,12 @@ From the start routine, the game runs:
    (`_nacht.dz` … `_derriese_full.dz`), `frontend/frontend.group.bin` and
    `frontend/mapInfo/mapInfo.group.bin`;
 8. its main loop, using about 40 distinct GL functions (matrices, client arrays,
-   `glDrawElements`) and `eglSwapBuffers`. A two-minute run swaps 4800 frames
-   without stopping.
+   `glDrawElements`) and `eglSwapBuffers`.
+
+With the real backend on the Mac, the frames show the Activision and Treyarch
+splash screens and then the title screen, "Touch screen to start", drawn
+correctly. Nothing touches the screen yet, so it stays there. Frames aren't
+paced: the loop runs as fast as it can.
 
 Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
 `0x1fd7c`, s3eKeyboard `0x2ba58`, `0x2bae8`, `0x2bd38`, s3eMemory `0x2f7a8`,
@@ -231,11 +264,14 @@ Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
 
 Next:
 
-- **Rendering.** A GL backend that draws: GLES 1.1 through EAGL on iOS, and
-  for the host an offscreen desktop GL context (fixed-point `x` calls
-  converted to float) that can save frames, so the frontend can be checked.
-  Client-array pointers are guest addresses and become host pointers through
-  `G()`; with a buffer bound they stay offsets.
-- **Events and time.** Deliver device, pointer and timer callbacks from
-  s3eDeviceYield, and pace frames.
+- **Events and time.** Deliver pointer (touch), device and timer callbacks
+  from s3eDeviceYield, and pace frames. A scripted tap on the host would take
+  the game past the title screen.
+- **The iOS app.** An app shell with a landscape EAGL view (an
+  `EAGLContext` and a renderbuffer from its layer, bound at eglMakeCurrent and
+  presented at eglSwapBuffers) and touch input. `gl_real.c` already compiles
+  for iOS.
+- **LZMA on iOS.** The iOS SDK has no liblzma, so `compress.c` doesn't build
+  there; it needs a bundled LZMA decoder (the LZMA SDK's `LzmaDec.c` is in
+  the public domain).
 - **The missing imports above.**
