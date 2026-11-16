@@ -22,15 +22,18 @@ directory (default `save/`).
 
 | file | what |
 |---|---|
-| `main.c` | maps memory, loads the image, reads the config, calls the start routine `0x65f00` on an 8 MB guest stack |
+| `main.c` | `codz_run(app, save)`: maps memory, loads the image, reads the config, calls the start routine `0x65f00` on an 8 MB guest stack; `main()` on the Mac |
 | `mem.c` | 4 GB guest reservation; the guest heap (size-class free lists in `0x10000000`–`0x30000000`) |
 | `loader.c` | copies the executable's segments, decrypts the game's data, builds the function table |
 | `config.c` | the embedded `.icf`: groups, conditional blocks, integer expressions |
 | `file.c` | guest paths (`rom://`, `ram://`, relative) to the bundle and the save directory |
 | `dispatch.c` | `rt_import` (stub → handler), indirect calls to unlifted code, return mismatches, `guest_call` for callbacks, diagnostics |
 | `s3e.c` | the s3e functions identified so far, including files and user file systems |
-| `compress.c` | s3eCompression's streaming decompressor: LZMA (liblzma) and zlib/gzip/deflate |
-| `gl.c` | OpenGL ES by name (none yet) |
+| `compress.c` | s3eCompression's streaming decompressor: LZMA (the LZMA SDK's LzmaDec) and zlib/gzip/deflate |
+| `gl.c`, `gl_real.c` | s3eGL, EGL and the GL backends |
+| `pvrtc.c` | PVRTC decoding for desktop GL |
+| `input.c` | pointer events and scripted taps |
+| `../ios/app.m` | the iOS app: game thread, EAGL view, touches |
 
 ## Things the game expects from the loader
 
@@ -87,9 +90,12 @@ to the callbacks through `guest_call`.
 format (properties `0x5d`, 64 KB dictionary, 64-bit unpacked size), unpacked
 through **s3eCompressionDecompInit(alg 0, readFn, userData)** /
 **DecompRead(handle, buf, &len)** / **DecompFinal**. The loader pulls
-input with the game's `readFn({buf, len}, userData)`. The host build uses
-Homebrew's liblzma; iOS will need it built for the device or a vendored
-decoder.
+input with the game's `readFn({buf, len}, userData)`. The decoder is the LZMA
+SDK's `LzmaDec` (Igor Pavlov, public domain). It isn't kept in the repository:
+`build.sh` fetches `LzmaDec.c` and its headers from 7-Zip's repository at a
+pinned release (26.06) into `build/third_party`, checks each against its
+SHA-256, and compiles it into every target. The level loads the same through
+it as it did through liblzma.
 
 **Stack.** The loader runs the entry on a fibre whose stack size comes from
 config (default `0x8000`). We use one 8 MB stack.
@@ -242,7 +248,7 @@ screen coordinates, as the loader did.
 
 On the host, `RT_TAPS` scripts taps by frame number, which keeps runs
 repeatable: `RT_TAPS="1500:240,160;1700:90,78"` presses at (240, 160) at frame
-1500, releases three frames later, and so on. These taps take the game from
+1500, releases three frames later (`RT_TAP_HOLD` frames), and so on. These taps take the game from
 the title screen to a level:
 
 | frame | where | what |
@@ -263,6 +269,40 @@ and its archive file system only finds `levels/nacht/nacht_shared.group.bin`.
 The loader must have tidied names on the way, so s3eFileOpen and
 s3eFileCheckExists hand the user file systems the name with empty and `.`
 components dropped and `..` taking off the one before it.
+
+## The iOS app
+
+`ios/app.m` and `ios/Info.plist`; `./build.sh sim` builds
+`build/CoDZombies-sim.app` for the arm64 simulator and `./build.sh ios` the
+device app (signed with `$CODESIGN_IDENTITY` when that is set). The bundle
+holds the original executable as `kiwi` (the loader reads its segments), the
+`.dz` archives and the intro video; saves go to Documents.
+
+- The game's start routine never returns, so it runs on a thread of its own
+  with a 64 MB stack (the lifted code recurses as the original did; secondary
+  threads get 512 KB by default). UIKit keeps the main thread.
+- The view is the largest 3:2 rectangle in the landscape window, centred, with
+  a content scale that makes its EAGL drawable exactly 480×320; Core Animation
+  scales it up. The OpenGL ES 1.1 context and its framebuffer are made on the
+  game thread at eglMakeCurrent, and eglSwapBuffers presents.
+- Touches become pointer events in game coordinates (a press is preceded by a
+  motion event to the same point, as a mouse would send). A quick tap's press
+  and release can land in one frame, and the game looks at the button once a
+  frame, so `input.c` delivers a release no sooner than two frames after its
+  press. `RT_LOG_TOUCH=1` logs touches and their delivery (in the simulator,
+  `SIMCTL_CHILD_RT_LOG_TOUCH=1 xcrun simctl launch --console-pty …`).
+- Imports not written yet return 0 and are logged, as `RT_MISSING=zero` does
+  on the Mac.
+
+In the iOS 26.5 simulator (iPhone 17) the game shows its splash screens and
+the title screen, and ordinary taps take it through the main menu,
+single-player menu and level select into Nacht der Untoten, which plays
+("Round 1", HUD, sticks, weapon). Screens change a few seconds after a tap;
+with other heavy work on the Mac at the same time, much later (the game's
+busy loop competes for the CPU).
+
+`./build.sh ios` compiles and links the device app as well; it hasn't run on
+a device yet.
 
 ## Screen
 
@@ -315,11 +355,11 @@ Next:
 - **Device and timer callbacks** (suspend and resume, s3eTimer `0x3ac5c`),
   and a yield that sleeps instead of the busy loop.
 - **Sound**: nothing plays yet (s3eSound, the sound groups are loaded).
-- **The iOS app.** An app shell with a landscape EAGL view (an
-  `EAGLContext` and a renderbuffer from its layer, bound at eglMakeCurrent and
-  presented at eglSwapBuffers) and touch input. `gl_real.c` already compiles
-  for iOS.
-- **LZMA on iOS.** The iOS SDK has no liblzma, so `compress.c` doesn't build
-  there; it needs a bundled LZMA decoder (the LZMA SDK's `LzmaDec.c` is in
-  the public domain).
+- **On a device.** The 4 GB guest reservation may need the extended virtual
+  addressing entitlement, and the app needs signing.
+- **Drawing at the screen's resolution** instead of scaling up 480×320
+  (scaling the game's viewport and scissor).
+- **Multi-touch.** The game registers only the single-pointer callbacks; its
+  two on-screen sticks will want the touch events (ids 2 and 3) if it uses
+  them elsewhere.
 - **The missing imports above.**
