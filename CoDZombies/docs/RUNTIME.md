@@ -242,16 +242,37 @@ weapon come out right.
 
 ## Input
 
-The game registers two s3ePointer callbacks (device 6 in the loader's
-registry, through `0x2fe2c`, which is s3ePointerRegister): id 0, button
-events, at `0x16966c` and id 1, motion events, at `0x1696e8`. It doesn't poll
-the pointer. `runtime/input.c` queues events and s3eDeviceYield delivers them
-as `fn(event, userdata)`, with `{button 0, pressed, x, y}` or `{x, y}` in
-screen coordinates, as the loader did.
+The game asks `s3ePointerGetInt(S3E_POINTER_MULTI_TOUCH_AVAILABLE)` and, told
+yes, registers the touch callbacks (device 6 in the loader's registry,
+through `0x2fe2c`, which is s3ePointerRegister): id 2, touch events, at
+`0x169658` and id 3, touch motion, at `0x169974`. (Told no, it registered
+the single-pointer ones, 0 at `0x16966c` and 1 at `0x1696e8`.) It also polls
+the pointer every frame: s3ePointerUpdate, then s3ePointerGetState(0), and
+GetX/GetY while it is down. `runtime/input.c` queues touches with ids 0-9 and
+s3eDeviceYield delivers them as `fn(event, userdata)`:
+
+| id | event |
+|---|---|
+| 0 | `{button 0, pressed, x, y}` (touch 0 only) |
+| 1 | `{x, y}` (touch 0 only) |
+| 2 | `{touchID, pressed, x, y}` |
+| 3 | `{touchID, x, y}` |
+
+in screen coordinates, as the loader did. Touch ids reach the game from 1:
+it keeps 0 for "no touch", and a touch with id 0 on one of the sticks made
+it pause instead of moving or firing. The first touch also drives the polled
+state. The pointer stubs (`0x2bdbe4`–`0x2bdc70`) are alphabetical: GetInt
+`0x2fdb8` (0 available 1, 1 hide cursor 0, 2 type and 3 stylus type 2, 4
+multi-touch 1, as the loader's table at `0x4b398` says), GetState `0x2f838`
+(bits: down 1, pressed 2, released 4; 5 for a button above 4), GetX
+`0x2f8c0`, GetY `0x2f874`, Register `0x2fe2c`, SetInt `0x2fdec`, UnRegister
+`0x2fdfc`, Update `0x2f7a8` (latches the state). The iOS app gives each
+UITouch the lowest free id for as long as it lasts.
 
 On the host, `RT_TAPS` scripts taps by frame number, which keeps runs
 repeatable: `RT_TAPS="1500:240,160;1700:90,78"` presses at (240, 160) at frame
-1500, releases three frames later (`RT_TAP_HOLD` frames), and so on. These taps take the game from
+1500, releases three frames later (`RT_TAP_HOLD` frames), and so on;
+`3300:400,250-460,250:60` drags from (400, 250) to (460, 250) over 60 frames. These taps take the game from
 the title screen to a level:
 
 | frame | where | what |
@@ -260,6 +281,8 @@ the title screen to a level:
 | 1700 | 90, 78 | main menu: Single Player |
 | 1900 | 80, 118 | New Game |
 | 2100 | 110, 118 | level select: Nacht der Untoten |
+| 3000 | 400, 250 | in the level: the right stick fires |
+| 3300 | 400,250-460,250:60 | dragging it turns the view |
 
 `tools/discover.sh` passes `RT_*` settings through, so it can run with taps;
 `LOG_IMPORTS=0` leaves out the import log and `TIMEOUT` sets the seconds per
@@ -369,7 +392,8 @@ doesn't sleep.
 the callee-saved registers, and s3eDeviceYield, reading its argument after the
 sound callbacks had run, took a callback's return value (256) for a time to
 sleep, which made the game crawl. `RT_FRAME_LOG=n` logs every nth frame
-(default 600).
+(default 600), and `RT_PEEK=addr,offset` logs the word at `[[addr]+offset]`
+with it.
 
 ## Screen
 
@@ -411,20 +435,28 @@ zombies win and it shows "Game Over: You Have Survived 1 Round". Sound plays
 through it: music in the menus, effects in the level. A minute takes about
 1.6 s of CPU on the Mac.
 
-Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
-`0x1fd7c`, s3eKeyboard `0x2ba58`, `0x2bae8`, `0x2bd38`, s3eMemory `0x2f7a8`,
-`0x2f838`, `0x2fdb8`, s3eSocket `0x30d88`, s3eTimer `0x3ac5c` and
-`0x3b064`, s3eVideo `0x3ba74`.
+The other imports it reaches, identified from the loader:
+
+| impl | function | answer |
+|---|---|---|
+| `0x3ac5c` | s3eTimerSetTimer(ms, fn, userData) | one-shot timers, run from s3eDeviceYield as `fn(NULL, userData)`; the game sets 100 and 300 ms ones |
+| `0x3aaf4` | s3eTimerCancelTimer(fn, userData) | |
+| `0x1fd7c` | s3eDeviceGetString | fixed strings; the game asks for 2 (the hardware model) and 25 (a UIDevice id) |
+| `0x2bd38`, `0x2bae8`, `0x2ba58` | s3eKeyboardUpdate, GetState, GetInt | 0: no keys |
+| `0x1161c`, `0x11588`, `0x1153c`, `0x114f0`, `0x11640`, `0x115d4` | s3eAccelerometerGetInt, GetX, GetY, GetZ, Start, Stop | one held still at (−725, 0, −725) thousandths of g; told there is none, the game makes up readings from the pointer (`0x1a4d94`) |
+| `0x30d88` | a socket query | 0 |
+| `0x3ba74` | s3eVideoPlay("videos/intro.mp4") | an error: the intro isn't played |
+| `0x1ece0` | a request flag the game polls | 0 |
+
+Still unknown: `0x3b064`, called once with a heap pointer, returning 0.
 
 Next:
 
-- **Device and timer callbacks** (suspend and resume, s3eTimer `0x3ac5c`).
+- **Device callbacks** (suspend and resume).
 - **s3eAudio** (music files) when the game first asks for it.
 - **On a device.** The 4 GB guest reservation may need the extended virtual
   addressing entitlement, and the app needs signing.
 - **Drawing at the screen's resolution** instead of scaling up 480×320
   (scaling the game's viewport and scissor).
-- **Multi-touch.** The game registers only the single-pointer callbacks; its
-  two on-screen sticks will want the touch events (ids 2 and 3) if it uses
-  them elsewhere.
-- **The missing imports above.**
+- **The intro video** (AVPlayer on iOS), and real accelerometer readings
+  (CoreMotion) if the game tilts with them.
