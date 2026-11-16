@@ -177,6 +177,7 @@ static inline float f_s(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 typedef void (*GuestFn)(CPU *);
 
 extern GuestFn *g_ftab;       /* dense table indexed by (addr - g_ftab_base) / 2 */
+extern uint8_t *g_fmode;      /* 1 where that function is Thumb */
 extern uint32_t g_ftab_base, g_ftab_size;
 
 void rt_call_slow(CPU *c, uint32_t addr);
@@ -187,17 +188,17 @@ void rt_unimplemented(CPU *c, uint32_t addr, const char *text) __attribute__((no
 void rt_bad_code(CPU *c, uint32_t from, uint32_t target) __attribute__((noreturn));
 uint32_t rt_strex(CPU *c, uint32_t addr, uint32_t value, int size);
 
-/* Indirect call through a register (bit 0 selects Thumb; the table is keyed by
- * the address without it). */
+/* Indirect call through a register. Bit 0 selects Thumb; the table is keyed by
+ * the address without it, so a function lifted in the other mode is a miss. */
 static inline void rt_call(CPU *c, uint32_t a) {
     uint32_t i = ((a & ~1u) - g_ftab_base) >> 1;
-    if (i < g_ftab_size && g_ftab[i]) g_ftab[i](c);
+    if (i < g_ftab_size && g_ftab[i] && g_fmode[i] == (a & 1)) g_ftab[i](c);
     else rt_call_slow(c, a);
 }
 /* Indirect jump that leaves the function: a tail call. */
 static inline void rt_jmp(CPU *c, uint32_t a, uint32_t from) {
     uint32_t i = ((a & ~1u) - g_ftab_base) >> 1;
-    if (i < g_ftab_size && g_ftab[i]) g_ftab[i](c);
+    if (i < g_ftab_size && g_ftab[i] && g_fmode[i] == (a & 1)) g_ftab[i](c);
     else rt_jmp_slow(c, a, from);
 }
 
