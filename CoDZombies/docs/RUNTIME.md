@@ -133,12 +133,13 @@ Bringing the game up exposed control flow the static passes had missed:
   routines at `0x665cc`). Every instruction of the run after it is a possible
   target. Two bogus starts inside that loop came out of `extra_funcs.tsv`.
 - Code still found only at run time is recorded in `extra_funcs.tsv` and lifted
-  next time (`tools/discover.sh`). Nine starts so far.
+  next time (`tools/discover.sh`). Twenty starts so far.
 
 ## Imports identified
 
 | impl | function | notes |
 |---|---|---|
+| `0x3a954` | s3eTimerGetLocalTimeOffset | ms, 64-bit; the loader takes `tm_gmtoff` of `localtime(time(NULL))` |
 | `0x2e718` | s3eMemorySetUserMemMgr | the game installs its own malloc/realloc/free (`0x25511d`, `0x255449`, `0x254cf9`) |
 | `0x2ed9c` | s3eMallocBase | guest heap |
 | `0x2f16c` | s3eReallocBase | |
@@ -218,9 +219,50 @@ becomes float, pointers are guest addresses (`G()`), and the enum-valued
 arrays, and the game's vertex positions are fixed point (3 × `GL_FIXED`,
 stride 20): those are converted to float at each draw, over the index range
 the draw uses. Texture coordinates are `GL_SHORT`, colours bytes, indices
-16-bit, textures RGB and RGBA (bytes or 4444); the game uses no buffer
-objects. Compressed (PVRTC) textures have no desktop format and are left
-empty on the Mac; none have appeared yet.
+16-bit, menu textures RGB and RGBA (bytes or 4444).
+
+In a level the game also uses buffer objects, and its textures are PVRTC
+(`0x8c02`, RGBA 4 bpp). Array pointers set while a buffer is bound are
+offsets into it and pass through as such. Each buffer keeps a host copy of
+its contents, so `GL_FIXED` data in a buffer can still be converted and the
+index range of a draw read. The Mac has no PVRTC, so `runtime/pvrtc.c`
+decodes it to RGBA8 (written from the format's description; the 2 bpp
+interpolated mode always averages both ways, a close approximation). There
+was no encoder at hand to test it against, but the level's walls, floors and
+weapon come out right.
+
+## Input
+
+The game registers two s3ePointer callbacks (device 6 in the loader's
+registry, through `0x2fe2c`, which is s3ePointerRegister): id 0, button
+events, at `0x16966c` and id 1, motion events, at `0x1696e8`. It doesn't poll
+the pointer. `runtime/input.c` queues events and s3eDeviceYield delivers them
+as `fn(event, userdata)`, with `{button 0, pressed, x, y}` or `{x, y}` in
+screen coordinates, as the loader did.
+
+On the host, `RT_TAPS` scripts taps by frame number, which keeps runs
+repeatable: `RT_TAPS="1500:240,160;1700:90,78"` presses at (240, 160) at frame
+1500, releases three frames later, and so on. These taps take the game from
+the title screen to a level:
+
+| frame | where | what |
+|---|---|---|
+| 1500 | 240, 160 | title screen: "Touch screen to start" |
+| 1700 | 90, 78 | main menu: Single Player |
+| 1900 | 80, 118 | New Game |
+| 2100 | 110, 118 | level select: Nacht der Untoten |
+
+`tools/discover.sh` passes `RT_*` settings through, so it can run with taps;
+`LOG_IMPORTS=0` leaves out the import log and `TIMEOUT` sets the seconds per
+run.
+
+## File names
+
+The game builds names like `levels/nacht//environment//../nacht_shared.group.bin`,
+and its archive file system only finds `levels/nacht/nacht_shared.group.bin`.
+The loader must have tidied names on the way, so s3eFileOpen and
+s3eFileCheckExists hand the user file systems the name with empty and `.`
+components dropped and `..` taking off the one before it.
 
 ## Screen
 
@@ -253,9 +295,15 @@ From the start routine, the game runs:
    `glDrawElements`) and `eglSwapBuffers`.
 
 With the real backend on the Mac, the frames show the Activision and Treyarch
-splash screens and then the title screen, "Touch screen to start", drawn
-correctly. Nothing touches the screen yet, so it stays there. Frames aren't
-paced: the loop runs as fast as it can.
+splash screens and the title screen. With the taps above, the game goes
+through the main menu, the single-player menu and level select, loads Nacht
+der Untoten (its sound, environment, shared and dynamics groups and the
+`ingame/` groups: effects, zombies, player, characters, cameras) and plays
+it: the level, HUD and weapon draw correctly, and with nobody playing the
+zombies win and it shows "Game Over: You Have Survived 1 Round". A five-minute
+run makes about 13,000 frames, about 44 a second. The game paces itself by
+calling s3eDeviceYield(0) and s3eTimerGetMs in a busy loop, about 1,400 times
+a frame.
 
 Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
 `0x1fd7c`, s3eKeyboard `0x2ba58`, `0x2bae8`, `0x2bd38`, s3eMemory `0x2f7a8`,
@@ -264,9 +312,9 @@ Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
 
 Next:
 
-- **Events and time.** Deliver pointer (touch), device and timer callbacks
-  from s3eDeviceYield, and pace frames. A scripted tap on the host would take
-  the game past the title screen.
+- **Device and timer callbacks** (suspend and resume, s3eTimer `0x3ac5c`),
+  and a yield that sleeps instead of the busy loop.
+- **Sound**: nothing plays yet (s3eSound, the sound groups are loaded).
 - **The iOS app.** An app shell with a landscape EAGL view (an
   `EAGLContext` and a renderbuffer from its layer, bound at eglMakeCurrent and
   presented at eglSwapBuffers) and touch input. `gl_real.c` already compiles
