@@ -37,7 +37,7 @@ SENTINEL = 0xFFFF0000
 
 
 def is_leaf(an, entry, body):
-    addrs, tables, calls = body
+    addrs, tables, calls = body[:3]
     if calls or not addrs:
         return False
     mode = an.starts[entry]
@@ -163,7 +163,7 @@ def main():
     so = ctypes.CDLL(build(args.out))
     proto = ctypes.CFUNCTYPE(None, ctypes.POINTER(CPU))
     nlog = ctypes.c_int.in_dll(so, "g_nlog")
-    glog = ((ctypes.c_uint32 * 2) * 4096).in_dll(so, "g_log")
+    glog = ((ctypes.c_uint32 * 2) * (1 << 20)).in_dll(so, "g_log")
     space = mmap.mmap(-1, (1 << 32) + PAGE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANON,
                       prot=mmap.PROT_READ | mmap.PROT_WRITE)
     ctypes.c_void_p.in_dll(so, "g_mem").value = ctypes.addressof(ctypes.c_char.from_buffer(space))
