@@ -182,6 +182,7 @@ static void eglSwapBuffers(CPU *c) {            /* (dpy, surface) */
     if (!egl_check_display(arg(c, 0)) || arg(c, 1) != SURFACE) { ret32(c, 0); return; }
     if (++frames <= 3 || frames % 600 == 0) rt_log("eglSwapBuffers: frame %u", frames);
     if (g_gl_real) gl_real_swap(frames);
+    input_frame(frames);
     egl_true(c, 1);
 }
 /* (name): the stub of the GL import of that name, with any OES suffix dropped
