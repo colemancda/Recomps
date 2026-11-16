@@ -54,7 +54,7 @@ GLUE = r'''
 #include <stdio.h>
 #include <stdlib.h>
 uint8_t *g_mem;
-GuestFn *g_ftab; uint32_t g_ftab_base, g_ftab_size;
+GuestFn *g_ftab; uint8_t *g_fmode; uint32_t g_ftab_base, g_ftab_size;
 #define LOG_CAP (1 << 20)
 uint32_t g_log[LOG_CAP][2]; int g_nlog;
 void rt_log_store(uint32_t a, uint32_t n) { if (g_nlog < LOG_CAP) { g_log[g_nlog][0] = a; g_log[g_nlog][1] = n; g_nlog++; } }
