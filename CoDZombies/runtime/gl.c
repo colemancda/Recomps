@@ -180,7 +180,9 @@ static void eglQueryString(CPU *c) {            /* (dpy, name) */
 static void eglSwapBuffers(CPU *c) {            /* (dpy, surface) */
     static uint32_t frames;
     if (!egl_check_display(arg(c, 0)) || arg(c, 1) != SURFACE) { ret32(c, 0); return; }
-    if (++frames <= 3 || frames % 600 == 0) rt_log("eglSwapBuffers: frame %u", frames);
+    static uint32_t every;
+    if (!every) { const char *e = getenv("RT_FRAME_LOG"); every = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 600; }
+    if (++frames <= 3 || frames % every == 0) rt_log("eglSwapBuffers: frame %u", frames);
     if (g_gl_real) gl_real_swap(frames);
     input_frame(frames);
     egl_true(c, 1);
