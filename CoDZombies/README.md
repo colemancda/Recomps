@@ -25,7 +25,7 @@ The App Store copy (`IPA/COD Zombies 1.5.0.ipa`) is FairPlay-encrypted
 (`cryptid 1`) and can't be used; `extract.sh` refuses it. The two decrypted
 IPAs in `IPA/Decrypted/` contain the same executable.
 
-## Status: step 0 (survey)
+## Status: step 1 (lifter)
 
 - The decrypted binary runs under Bridge32 (dynarmic) as a Mac Catalyst app
   up to the title screen; see `docs/SURVEY.md`.
@@ -37,6 +37,11 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   the `.dz` archives, timers, device events), and r9 is an ordinary register.
 - `tools/s3e_survey.py` finds 15712 functions by recursive descent (85% ARM,
   15% Thumb-1), covering 80% of the game code.
-- Not started yet: the ARM/Thumb lifter and the runtime.
+- The lifter (`lift/`) turns all 15478 functions into C with nothing left
+  untranslated. `./build.sh ios` compiles it for arm64 iOS. Single
+  instructions (72k runs) and 400 whole leaf functions match Unicorn; see
+  `docs/LIFTER.md`.
+- Not started yet: the runtime (guest memory, the s3e and GL imports,
+  callbacks, threads), so nothing links or runs yet.
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
