@@ -53,8 +53,10 @@ typedef struct ImportImpl {
     const char *name;      /* our name for it */
     ImportFn fn;
 } ImportImpl;
-extern const ImportImpl g_s3e_impls[];
+extern const ImportImpl g_s3e_impls[];       /* s3e.c */
 extern const uint32_t g_s3e_impl_count;
+extern const ImportImpl g_compress_impls[];  /* compress.c */
+extern const uint32_t g_compress_impl_count;
 void imports_init(void);
 
 /* Arguments of an import: r0-r3, then the guest stack. */
