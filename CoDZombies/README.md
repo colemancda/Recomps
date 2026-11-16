@@ -47,6 +47,8 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   functions, among them files, the game's own archive file system and LZMA
   decompression, plus the loader's dummy EGL. Its GL backend draws through
   desktop GL offscreen (`RT_GL=1`, frames saved with `RT_GL_DUMP`): the game
-  shows its splash screens and the title screen. Input is the next piece.
+  shows its splash screens, the menus and, with scripted taps (`RT_TAPS`), a
+  level of Nacht der Untoten played through to "Game Over". Next are sound and
+  the iOS app.
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
