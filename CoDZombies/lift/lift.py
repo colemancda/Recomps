@@ -55,7 +55,7 @@ class FunctionContext:
         if stub is not None:
             em.stats["tail_imports"] += 1
             return "{ rt_import(c, 0x%08xu); return; }" % stub
-        if t in em.an.starts:
+        if em.an.starts.get(t) == self.mode:
             em.stats["tailcalls"] += 1
             return "{ f_%08x(c); return; }" % t
         em.stats["bad_targets"] += 1
