@@ -412,26 +412,6 @@ static void s3eTimer3a964(CPU *c) { ret32(c, arg(c, 0) == 0 ? 1 : (uint32_t)-1);
 /* 0x1dea8, 0x1deb0: debugging hooks compiled out of the loader; always 0. */
 static void s3eReturnZero(CPU *c) { ret32(c, 0); }
 
-/* ----------------------------------------------------------------- sound */
-/* 0x398bc s3eSoundGetInt(s3eSoundProperty), in Marmalade's property order. No
- * audio yet, so S3E_SOUND_AVAILABLE is 0; the rate matters even so, the game
- * divides by it. */
-static void s3eSoundGetInt(CPU *c) {
-    static const int32_t values[] = {
-        256,    /* 0 S3E_SOUND_VOLUME */
-        22050,  /* 1 S3E_SOUND_DEFAULT_FREQ */
-        22050,  /* 2 S3E_SOUND_OUTPUT_FREQ */
-        16,     /* 3 S3E_SOUND_NUM_CHANNELS */
-        0,      /* 4 S3E_SOUND_USED_CHANNELS */
-        0,      /* 5 S3E_SOUND_AVAILABLE */
-        256,    /* 6 S3E_SOUND_VOLUME_DEFAULT */
-    };
-    uint32_t p = arg(c, 0);
-    if (p < sizeof values / sizeof values[0]) { ret32(c, (uint32_t)values[p]); return; }
-    if (p <= 13) { ret32(c, 0); return; }
-    ret32(c, (uint32_t)-1);
-}
-
 /* ----------------------------------------------------------------- debug */
 /* 0x1e068 s3eDebugErrorShow(s3eMessageType type, const char *text) */
 static void s3eDebugErrorShow(CPU *c) {
@@ -440,11 +420,42 @@ static void s3eDebugErrorShow(CPU *c) {
 }
 
 /* --------------------------------------------------------------- surface */
-/* 0x39c3c s3eSurfacePtr(): the 320x480 RGB565 frame buffer, made on first use. */
+/* 0x39c3c s3eSurfacePtr(): the RGB565 frame buffer, made on first use. */
 static void s3eSurfacePtr(CPU *c) {
     static uint32_t surface;
-    if (!surface) surface = guest_alloc(320 * 480 * 2);
+    if (!surface) surface = guest_alloc(SCREEN_W * SCREEN_H * 2);
     ret32(c, surface);
+}
+
+/* 0x398bc s3eSurfaceGetInt(s3eSurfaceProperty). The loader reads fields of its
+ * surface record (error device 2, Surface): 0 width +0x24, 1 height +0x28,
+ * 2 pitch +0x2c, 3 pixel type +0x30, 4 device pixel type +0x38, 5 device width
+ * +0x3c, 6 device height +0x44, 7 blit direction +0x40, 8 display +0x20,
+ * 9 always 0, 10 always 1 (displays), 11 device blit direction +0x1c, 12 a
+ * search of the pixel type table. IwGx turns its picture by
+ * ([+0x224] - property 11) mod 4 quarter turns (0x169988).
+ * (This was taken for s3eSoundGetInt at first: the 22050 "rate" became the
+ * screen height.) We report a SCREEN_W x SCREEN_H RGB565 surface that needs
+ * no turning; see rt.h. */
+static void s3eSurfaceGetInt(CPU *c) {
+    static const int32_t values[] = {
+        SCREEN_W,       /* 0 width */
+        SCREEN_H,       /* 1 height */
+        SCREEN_W * 2,   /* 2 pitch (bytes) */
+        0x422,          /* 3 pixel type: RGB565, as passed to s3eSurfaceSetup */
+        0x422,          /* 4 device pixel type */
+        SCREEN_W,       /* 5 device width */
+        SCREEN_H,       /* 6 device height */
+        0,              /* 7 blit direction: normal */
+        0,              /* 8 display */
+        0,              /* 9 */
+        1,              /* 10 number of displays */
+        0,              /* 11 device blit direction: normal */
+    };
+    uint32_t p = arg(c, 0);
+    if (p < sizeof values / sizeof values[0]) { ret32(c, (uint32_t)values[p]); return; }
+    rt_log("s3eSurfaceGetInt(%u): not known, 0", p);
+    ret32(c, p <= 13 ? 0 : (uint32_t)-1);
 }
 
 /* 0x39c6c s3eSurfaceSetup(pixelType, ...) */
@@ -472,7 +483,7 @@ const ImportImpl g_s3e_impls[] = {
     {0x00027cdc, "s3eFileSeek", s3eFileSeek},
     {0x00027fb0, "s3eFileMakeDirectory", s3eFileMakeDirectory},
     {0x000285b8, "s3eFileCheckDirectoryExists", s3eFileCheckDirectoryExists},
-    {0x000398bc, "s3eSoundGetInt", s3eSoundGetInt},
+    {0x000398bc, "s3eSurfaceGetInt", s3eSurfaceGetInt},
     {0x00039c3c, "s3eSurfacePtr", s3eSurfacePtr},
     {0x00039c6c, "s3eSurfaceSetup", s3eSurfaceSetup},
     {0x0003a964, "s3eTimer3a964", s3eTimer3a964},
