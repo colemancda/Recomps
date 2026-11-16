@@ -452,12 +452,20 @@ static void s3eRegisterDevice2(CPU *c) { register_callback(c, 2); }
 static void s3eRegisterDevice24(CPU *c) { register_callback(c, 24); }   /* 0x45b54 */
 static void s3eRegisterDevice6(CPU *c) { register_callback(c, 6); }     /* 0x2fe2c, s3ePointerRegister */
 
+int callbacks_registered(uint32_t device, uint32_t id) {
+    for (int k = 0; k < ncallbacks; k++)
+        if (callbacks[k].device == device && callbacks[k].id == id) return 1;
+    return 0;
+}
+
 /* Calls every callback registered for (device, id) as fn(data, userdata). */
 void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data) {
     for (int k = 0; k < ncallbacks; k++)
         if (callbacks[k].device == device && callbacks[k].id == id)
             guest_call(c, callbacks[k].fn, 2, data, callbacks[k].userdata);
 }
+
+static void timers_run(CPU *c);   /* below */
 
 /* 0x1f068 s3eDeviceYield(int32 ms): where the loader delivers events (see
  * input.c), and gives up the CPU for up to ms.
@@ -470,10 +478,99 @@ void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data) {
 static void s3eDeviceYield(CPU *c) {
     int32_t ms = (int32_t)arg(c, 0);
     input_deliver(c);
+    timers_run(c);
     sound_pump(c);
     if (ms > 0) usleep((useconds_t)(ms > 100 ? 100 : ms) * 1000);
     else if (++g_yield_spin >= 4) usleep(500);
     ret64(c, 0);
+}
+
+/* ---------------------------------------------------------------- timers */
+/* 0x3ac5c s3eTimerSetTimer(uint32 ms, s3eCallback fn, void *userData): a
+ * one-shot timer; fn(NULL, userData) runs from s3eDeviceYield once ms have
+ * passed (timers_run). The game sets them for 100 and 300 ms. */
+typedef struct { uint64_t due; uint32_t fn, ud; } Timer;
+#define NTIMERS 32
+static Timer timers[NTIMERS];
+
+static uint64_t now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+static void s3eTimerSetTimer(CPU *c) {
+    uint32_t ms = arg(c, 0), fn = arg(c, 1), ud = arg(c, 2);
+    if (!fn) { ret32(c, S3E_RESULT_ERROR); return; }
+    for (int k = 0; k < NTIMERS; k++) {
+        if (timers[k].fn) continue;
+        timers[k] = (Timer){now_ms() + ms, fn, ud};
+        ret32(c, S3E_RESULT_SUCCESS);
+        return;
+    }
+    rt_log("s3eTimerSetTimer: out of timers");
+    ret32(c, S3E_RESULT_ERROR);
+}
+/* 0x3aaf4 s3eTimerCancelTimer(fn, userData) */
+static void s3eTimerCancelTimer(CPU *c) {
+    for (int k = 0; k < NTIMERS; k++)
+        if (timers[k].fn && timers[k].fn == arg(c, 0) && timers[k].ud == arg(c, 1)) timers[k].fn = 0;
+    ret32(c, S3E_RESULT_SUCCESS);
+}
+static void timers_run(CPU *c) {
+    uint64_t t = 0;
+    for (int k = 0; k < NTIMERS; k++) {
+        if (!timers[k].fn) continue;
+        if (!t) t = now_ms();
+        if (timers[k].due > t) continue;
+        Timer due = timers[k];
+        timers[k].fn = 0;   /* before the call: the callback may set a new timer */
+        guest_call(c, due.fn, 2, 0, due.ud);
+    }
+}
+
+/* -------------------------------------------------------- device strings */
+/* 0x1fd7c s3eDeviceGetString(prop). The loader answers 8, 9 and 19 itself
+ * (build strings) and the rest from a table at 0x453c8: 0 the OS, 2 the
+ * hardware model (from sysctl), 3 the OS version, 25 a UIDevice property (the
+ * device's unique id). The game asks for 2 and 25. */
+static void s3eDeviceGetString(CPU *c) {
+    static uint32_t cache[32];
+    static const char *text[32] = {
+        [0] = "IPHONE", [1] = "IPHONE", [2] = "iPhone1,2", [3] = "3.1.3",
+        [8] = "ARM7", [9] = "4.3.0beta [231940u]", [19] = "4.25.1",
+        [25] = "0123456789abcdef0123456789abcdef01234567",
+    };
+    uint32_t p = arg(c, 0);
+    if (p >= 32) { ret32(c, guest_strdup("")); return; }
+    if (!cache[p]) cache[p] = guest_strdup(text[p] ? text[p] : "");
+    ret32(c, cache[p]);
+}
+
+/* --------------------------------------------------------- accelerometer */
+/* The stubs are alphabetical: GetInt 0x1161c, GetX 0x11588, GetY 0x1153c,
+ * GetZ 0x114f0, Start 0x11640, Stop 0x115d4 (void). Told there is none, the
+ * game makes up readings itself (0x1a4d94): noise around (-725, 0, -725) when
+ * nothing touches the screen, and an offset from the screen's centre while
+ * a finger is down, which it takes for a hard tilt and pauses the game. So
+ * there is one, held still at that neutral reading (thousandths of g: a phone
+ * in landscape, tilted 45 degrees towards the player). */
+static void s3eAccelerometerGetInt(CPU *c) { ret32(c, arg(c, 0) == 0 ? 1 : 0); }   /* 0: available */
+static void s3eAccelerometerGetX(CPU *c) { ret32(c, (uint32_t)-725); }
+static void s3eAccelerometerGetY(CPU *c) { ret32(c, 0); }
+static void s3eAccelerometerGetZ(CPU *c) { ret32(c, (uint32_t)-725); }
+static void s3eAccelerometerStart(CPU *c) { ret32(c, S3E_RESULT_SUCCESS); }
+static void s3eAccelerometerStop(CPU *c) { (void)c; }
+
+/* -------------------------------------------- answered "none" or "no" */
+/* s3eKeyboard (an iPhone has no keys): 0x2bd38 Update (shifts this frame's
+ * states to the last), 0x2bae8 GetState(key) (also the abstract game keys
+ * 200-210), 0x2ba58 GetInt. 0x30d88 a socket query (asked about networkAlwaysAvailable). 0x3ba74
+ * s3eVideoPlay("videos/intro.mp4", ...): not played. 0x1ece0 a request flag
+ * the game polls. */
+static void s3eNone(CPU *c) { ret32(c, 0); }
+static void s3eVideoPlay(CPU *c) {
+    rt_log("s3eVideoPlay(\"%s\"): not played", gstr(arg(c, 0)) ? gstr(arg(c, 0)) : "");
+    ret32(c, S3E_RESULT_ERROR);
 }
 
 /* 0x3a964 -> 0x4fda0: 1 for an argument of 0, otherwise a Timer error and -1. */
@@ -557,6 +654,21 @@ const ImportImpl g_s3e_impls[] = {
     {0x00039c3c, "s3eSurfacePtr", s3eSurfacePtr},
     {0x00039c6c, "s3eSurfaceSetup", s3eSurfaceSetup},
     {0x0003a954, "s3eTimerGetLocalTimeOffset", s3eTimerGetLocalTimeOffset},
+    {0x0003ac5c, "s3eTimerSetTimer", s3eTimerSetTimer},
+    {0x0003aaf4, "s3eTimerCancelTimer", s3eTimerCancelTimer},
+    {0x0001fd7c, "s3eDeviceGetString", s3eDeviceGetString},
+    {0x0002bd38, "s3eKeyboardUpdate", s3eNone},
+    {0x0002bae8, "s3eKeyboardGetState", s3eNone},
+    {0x0002ba58, "s3eKeyboardGetInt", s3eNone},
+    {0x0001161c, "s3eAccelerometerGetInt", s3eAccelerometerGetInt},
+    {0x00011588, "s3eAccelerometerGetX", s3eAccelerometerGetX},
+    {0x0001153c, "s3eAccelerometerGetY", s3eAccelerometerGetY},
+    {0x000114f0, "s3eAccelerometerGetZ", s3eAccelerometerGetZ},
+    {0x00011640, "s3eAccelerometerStart", s3eAccelerometerStart},
+    {0x000115d4, "s3eAccelerometerStop", s3eAccelerometerStop},
+    {0x00030d88, "s3eSocketGetInt", s3eNone},
+    {0x0001ece0, "s3eDeviceRequestFlag", s3eNone},
+    {0x0003ba74, "s3eVideoPlay", s3eVideoPlay},
     {0x0003a964, "s3eTimer3a964", s3eTimer3a964},
     {0x0003a974, "s3eTimerGetUTC", s3eTimerGetUTC},
     {0x0003ae20, "s3eTimerGetMs", s3eTimerGetMs},
