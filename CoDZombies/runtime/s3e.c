@@ -155,10 +155,51 @@ static void s3eFileAddUserFileSys(CPU *c) {
     ret32(c, S3E_RESULT_SUCCESS);
 }
 
-/* 0x277a8 s3eFileCheckExists(const char *filename): a user file system has no
- * exists callback, so its file exists if it opens; then the host. */
+/* The name as the user file systems get it, in guest memory: empty and "."
+ * components dropped and ".." taking off the one before it, after any drive
+ * prefix ("rom://"). The game asks for names like
+ * "levels/nacht//environment//../nacht_shared.group.bin", and its archive file
+ * system only finds "levels/nacht/nacht_shared.group.bin"; the loader must
+ * have tidied names on the way. NULL stays NULL. */
+static uint32_t ufs_name(uint32_t gname) {
+    static uint32_t buf;
+    const char *name = gstr(gname);
+    if (!name || (!strstr(name, "//") && !strstr(name, "/.") && strncmp(name, "./", 2))) return gname;
+    const char *drive = strstr(name, "://");
+    if (drive && strstr(drive + 3, "//") == NULL && strstr(drive + 3, "/.") == NULL) return gname;
+    if (!buf) buf = guest_alloc(1024);
+    char *out = (char *)G(buf);
+    size_t n = 0, keep = 0;
+    const char *p = name;
+    if (drive) {
+        keep = (size_t)(drive + 3 - name);
+        if (keep > 64) keep = 64;
+        memcpy(out, name, keep);
+        n = keep;
+        p = drive + 3;
+    }
+    while (*p) {
+        const char *e = strchr(p, '/');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == 0 || (len == 1 && p[0] == '.')) {
+            /* nothing */
+        } else if (len == 2 && p[0] == '.' && p[1] == '.') {
+            while (n > keep && out[n - 1] != '/') n--;   /* back over the last component */
+            if (n > keep) n--;                           /* and its slash */
+        } else if (n + len + 2 < 1024) {
+            if (n > keep) out[n++] = '/';
+            memcpy(out + n, p, len);
+            n += len;
+        }
+        p += len;
+        if (*p == '/') p++;
+    }
+    out[n] = 0;
+    return buf;
+}
+
 static void s3eFileCheckExists(CPU *c) {
-    uint32_t name = arg(c, 0);
+    uint32_t name = ufs_name(arg(c, 0));
     static uint32_t rb;
     if (!rb) rb = guest_strdup("rb");
     for (int k = nuser_fs - 1; k >= 0; k--) {
@@ -188,7 +229,7 @@ static void s3eFileOpenFromMemory(CPU *c) {
 /* 0x277a0 s3eFileOpen(const char *filename, const char *mode): user file
  * systems first (reading only), then the save directory or the bundle. */
 static void s3eFileOpen(CPU *c) {
-    uint32_t gname = arg(c, 0), gmode = arg(c, 1);
+    uint32_t gname = ufs_name(arg(c, 0)), gmode = arg(c, 1);
     const char *name = gstr(gname), *mode = gstr(gmode);
     if (!name || !mode) { ret32(c, 0); return; }
     int write = strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+');
@@ -353,6 +394,15 @@ static void s3eTimerGetMs(CPU *c) {
     ret64(c, (uint64_t)(t.tv_sec - t0.tv_sec) * 1000 + (uint64_t)((t.tv_nsec - t0.tv_nsec) / 1000000));
 }
 
+/* 0x3a954 s3eTimerGetLocalTimeOffset(): the local time zone's offset from UTC
+ * in ms, 64-bit (the loader takes tm_gmtoff of localtime(time(NULL))). */
+static void s3eTimerGetLocalTimeOffset(CPU *c) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    ret64(c, (uint64_t)((int64_t)tm.tm_gmtoff * 1000));
+}
+
 /* 0x3a974 s3eTimerGetUTC(): milliseconds since 1970 (the loader uses gettimeofday). */
 static void s3eTimerGetUTC(CPU *c) {
     struct timeval tv;
@@ -400,11 +450,21 @@ static void register_callback(CPU *c, uint32_t device) {
 static void s3eRegisterDevice13(CPU *c) { register_callback(c, 13); }
 static void s3eRegisterDevice2(CPU *c) { register_callback(c, 2); }
 static void s3eRegisterDevice24(CPU *c) { register_callback(c, 24); }   /* 0x45b54 */
-static void s3eRegisterDevice6(CPU *c) { register_callback(c, 6); }     /* 0x2fe2c, the pointer range */
+static void s3eRegisterDevice6(CPU *c) { register_callback(c, 6); }     /* 0x2fe2c, s3ePointerRegister */
 
-/* 0x1f068 s3eDeviceYield(int32 ms): where the loader delivers events. Nothing to
- * deliver yet. */
-static void s3eDeviceYield(CPU *c) { ret64(c, 0); }
+/* Calls every callback registered for (device, id) as fn(data, userdata). */
+void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data) {
+    for (int k = 0; k < ncallbacks; k++)
+        if (callbacks[k].device == device && callbacks[k].id == id)
+            guest_call(c, callbacks[k].fn, 2, data, callbacks[k].userdata);
+}
+
+/* 0x1f068 s3eDeviceYield(int32 ms): where the loader delivers events (see
+ * input.c). */
+static void s3eDeviceYield(CPU *c) {
+    input_deliver(c);
+    ret64(c, 0);
+}
 
 /* 0x3a964 -> 0x4fda0: 1 for an argument of 0, otherwise a Timer error and -1. */
 static void s3eTimer3a964(CPU *c) { ret32(c, arg(c, 0) == 0 ? 1 : (uint32_t)-1); }
@@ -486,6 +546,7 @@ const ImportImpl g_s3e_impls[] = {
     {0x000398bc, "s3eSurfaceGetInt", s3eSurfaceGetInt},
     {0x00039c3c, "s3eSurfacePtr", s3eSurfacePtr},
     {0x00039c6c, "s3eSurfaceSetup", s3eSurfaceSetup},
+    {0x0003a954, "s3eTimerGetLocalTimeOffset", s3eTimerGetLocalTimeOffset},
     {0x0003a964, "s3eTimer3a964", s3eTimer3a964},
     {0x0003a974, "s3eTimerGetUTC", s3eTimerGetUTC},
     {0x0003ae20, "s3eTimerGetMs", s3eTimerGetMs},
