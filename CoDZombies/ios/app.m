@@ -3,7 +3,7 @@
  * The game's start routine never returns (its main loop is inside), so it runs
  * on a thread of its own with a large stack (the lifted code recurses as the
  * original did, and secondary threads get 512 KB by default). The UI thread
- * keeps UIKit: it turns touches into pointer events for the game.
+ * keeps UIKit: it turns touches into touch events for the game (multi-touch).
  *
  * Drawing: the game draws a 480x320 picture (SCREEN_W x SCREEN_H) with
  * OpenGL ES 1.1. The view is the largest 3:2 rectangle that fits the window,
@@ -103,19 +103,32 @@ static void start_game(void) {
         layer.opaque = YES;
         layer.drawableProperties = @{kEAGLDrawablePropertyRetainedBacking: @NO,
                                      kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGBA8};
-        self.multipleTouchEnabled = NO;
+        self.multipleTouchEnabled = YES;
     }
     return self;
 }
+/* Touches get ids 0-9, the lowest free one, for as long as they last; the
+ * game sees them as s3ePointer touch events (and touch 0 as the pointer). */
+static UITouch *slots[10];
+- (int)slotFor:(UITouch *)t make:(BOOL)make {
+    for (int k = 0; k < 10; k++) if (slots[k] == t) return k;
+    if (!make) return -1;
+    for (int k = 0; k < 10; k++) if (!slots[k]) { slots[k] = t; return k; }
+    return -1;
+}
 - (void)send:(NSSet<UITouch *> *)touches kind:(int)kind pressed:(int)pressed {
-    UITouch *t = touches.anyObject;
-    CGPoint p = [t locationInView:self];
     CGSize s = self.bounds.size;
     if (s.width <= 0 || s.height <= 0) return;
-    int32_t x = (int32_t)(p.x * SCREEN_W / s.width), y = (int32_t)(p.y * SCREEN_H / s.height);
-    if (getenv("RT_LOG_TOUCH")) rt_log("touch kind %d pressed %d at %d,%d", kind, pressed, x, y);
-    if (kind == 0) input_pointer(1, 0, x, y);   /* move there first, as a mouse would */
-    input_pointer(kind, pressed, x, y);
+    for (UITouch *t in touches) {
+        int id = [self slotFor:t make:kind == 0 && pressed];
+        if (id < 0) continue;
+        CGPoint p = [t locationInView:self];
+        int32_t x = (int32_t)(p.x * SCREEN_W / s.width), y = (int32_t)(p.y * SCREEN_H / s.height);
+        if (getenv("RT_LOG_TOUCH")) rt_log("touch %d kind %d pressed %d at %d,%d", id, kind, pressed, x, y);
+        if (kind == 0) input_touch(id, 1, 0, x, y);   /* move there first, as a mouse would */
+        input_touch(id, kind, pressed, x, y);
+        if (kind == 0 && !pressed) slots[id] = nil;
+    }
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self send:touches kind:0 pressed:1];
