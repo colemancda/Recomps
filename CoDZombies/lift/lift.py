@@ -14,7 +14,8 @@ Each function is `void f_XXXXXXXX(CPU *c)`:
   - b to another function, or falling into one: tail call;
   - ARM jump tables: a switch on the loaded or computed target;
   - `mov lr, pc` followed by a write to pc: an indirect call;
-  - any other write to pc: rt_jmp (a tail call through the function table).
+  - any other write to pc: a return if the target is the lr the function was
+    called with (pop {r3}; bx r3), else rt_jmp (a tail call through the table).
 """
 import argparse
 import collections
@@ -31,7 +32,8 @@ from capstone import arm  # noqa: E402
 class FunctionContext:
     """Control flow for one function being emitted."""
 
-    def __init__(self, em, entry, mode, bodyset, tables):
+    def __init__(self, em, entry, mode, bodyset, tables, consts=None):
+        self.consts = consts or {}
         self.em = em
         self.entry = entry
         self.mode = mode
@@ -77,17 +79,26 @@ class FunctionContext:
         return "%s rt_call(c, 0x%08xu); %s" % (lr, t | (1 if tmode == "thumb" else 0), self.check_ret(ret))
 
     def icall(self, expr, ret, from_thumb):
+        t = self.consts.get(self.ins.address)
+        if t is not None and (t & ~1) in self.em.an.starts:
+            self.em.stats["icalls_resolved"] += 1
+            return "c->r[14] = 0x%08xu; f_%08x(c); %s" % (ret | (1 if from_thumb else 0), t & ~1, self.check_ret(ret))
         self.em.stats["icalls"] += 1
         return "c->r[14] = 0x%08xu; rt_call(c, %s); %s" % (ret | (1 if from_thumb else 0), expr, self.check_ret(ret))
 
     def indirect(self, ins, expr, kind):
         em = self.em
         a = ins.address
+        t = self.consts.get(a)
+        if t is not None and (t & ~1) in em.an.starts and kind == "reg":
+            # bx through a register holding a known constant (a PIC veneer)
+            if em.an.is_indirect_call(ins, self.mode):
+                em.stats["icalls_resolved"] += 1
+                return "f_%08x(c); %s" % (t & ~1, self.check_ret(a + ins.size))
+            em.stats["tailcalls"] += 1
+            return "{ f_%08x(c); return; }" % (t & ~1)
         # `mov lr, pc` right before: an indirect call returning to the next instruction
-        p = self.prev
-        if p is not None and p.address == a - 4 and p.id == arm.ARM_INS_MOV and len(p.operands) == 2 \
-                and p.reg_name(p.operands[0].reg) == "lr" and p.operands[1].type == arm.ARM_OP_REG \
-                and p.reg_name(p.operands[1].reg) == "pc" and kind != "lr":
+        if self.em.an.is_indirect_call(ins, self.mode) and kind != "lr":
             em.stats["icalls"] += 1
             return "rt_call(c, %s); %s" % (expr, self.check_ret(a + ins.size))
         if kind in ("lr", "pop"):
@@ -104,8 +115,10 @@ class FunctionContext:
                     cases.append("case 0x%08xu: f_%08x(c); return;" % (t, t))
             return "switch (%s) { %s default: rt_jmp(c, %s, 0x%08xu); return; }" % (
                 expr, " ".join(cases), expr, a)
+        # A jump to the address the function was called with is a return,
+        # whichever register carries it (Thumb-1: pop {r3}; bx r3).
         em.stats["ijumps"] += 1
-        return "rt_jmp(c, %s, 0x%08xu); return;" % (expr, a)
+        return "if (%s == lr0) { c->r[15] = lr0; return; } rt_jmp(c, %s, 0x%08xu); return;" % (expr, expr, a)
 
 
 class Emitter:
@@ -118,12 +131,13 @@ class Emitter:
     def function(self, entry, body):
         an = self.an
         mode = an.starts[entry]
-        addrs, tables, _ = body
+        addrs, tables, _, consts = body
         if not addrs:
             self.stats["empty"] += 1
             return "void f_%08x(CPU *c) { rt_bad_code(c, 0, 0x%08xu); }\n" % (entry, entry)
         bodyset = set(addrs)
-        ctx = FunctionContext(self, entry, mode, bodyset, tables)
+        self.current_mode = mode
+        ctx = FunctionContext(self, entry, mode, bodyset, tables, consts)
         out = []
         prev_end, prev_falls = None, False
         for a in addrs:
@@ -145,7 +159,7 @@ class Emitter:
         if prev_falls:
             ctx.ins = an.decode(addrs[-1], mode)
             out.append("    " + ctx.branch(prev_end))
-        head = ["void f_%08x(CPU *c) {" % entry]
+        head = ["void f_%08x(CPU *c) {" % entry, "    uint32_t lr0 = c->r[14]; (void)lr0;"]
         if addrs[0] != entry:
             ctx.labels.add(entry)
             head.append("    goto L_%08x;" % entry)
@@ -158,6 +172,9 @@ class Emitter:
                 lines.append(item)
         return "\n".join(head + lines) + "\n}\n"
 
+    def mode_of(self, ins):
+        return self.current_mode
+
     def falls_through(self, ins):
         i = ins.id
         cond = ins.cc not in (arm.ARM_CC_AL, arm.ARM_CC_INVALID)
@@ -166,8 +183,28 @@ class Emitter:
         if i in (arm.ARM_INS_BL, arm.ARM_INS_BLX):
             return True
         if self.an.writes_pc(ins):
-            return cond
+            return cond or self.an.is_indirect_call(ins, self.mode_of(ins))
         return True
+
+
+RET = {"void": 0, "i32": 1, "i64": 2, "-": 3}
+
+
+def write_imports(tsv, path):
+    """imports.c: one row per import stub, from tools/s3e_boundary.py's table."""
+    rows = []
+    with open(tsv) as f:
+        next(f)
+        for line in f:
+            stub, impl, tramp, ret, args, hooks, kind, sub, calls, _ = line.rstrip("\n").split("\t")
+            rows.append((int(stub, 16), int(impl, 16), RET[ret], 1 if args.startswith("stack") else 0, kind, sub))
+    with open(path, "w") as f:
+        f.write('#include "imports.h"\n\n')
+        f.write("const ImportStub g_import_stubs[] = {\n")
+        for stub, impl, ret, stack, kind, sub in rows:
+            k = {"call": "IMPORT_S3E", "import": "IMPORT_GL", "data": "IMPORT_DATA"}[kind]
+            f.write('    {0x%08xu, 0x%08xu, %d, %d, %s, "%s"},\n' % (stub, impl, ret, stack, k, sub))
+        f.write("};\nconst uint32_t g_import_stub_count = %d;\n" % len(rows))
 
 
 def main():
@@ -176,11 +213,15 @@ def main():
     ap.add_argument("--exe", default=os.path.join(root, "orig/Payload/kiwi.app/kiwi"))
     ap.add_argument("--funcs", default=os.path.join(root, "build/s3e_funcs.tsv"))
     ap.add_argument("--out", default=os.path.join(root, "build/gen"))
+    ap.add_argument("--extra", default=os.path.join(root, "extra_funcs.tsv"),
+                    help="function starts found at run time (address, mode), from RT_EXTRA_FUNCS")
     ap.add_argument("--chunk", type=int, default=12000, help="instructions per chunk file")
+    ap.add_argument("--imports", default=os.path.join(root, "build/s3e_boundary.tsv"),
+                    help="tools/s3e_boundary.py output, for <out>/imports.c")
     args = ap.parse_args()
 
     t0 = time.time()
-    an = analyze.Analysis(args.exe, args.funcs)
+    an = analyze.Analysis(args.exe, args.funcs, args.extra)
     bodies = an.all_functions()
     t1 = time.time()
     em = Emitter(an)
@@ -221,6 +262,8 @@ def main():
         for e in entries:
             f.write("    {0x%08xu, %d, f_%08x},\n" % (e, 1 if an.starts[e] == "thumb" else 0, e))
         f.write("};\nconst uint32_t g_lifted_count = %d;\n" % len(entries))
+    if args.imports:
+        write_imports(args.imports, os.path.join(args.out, "imports.c"))
     t2 = time.time()
     modes = collections.Counter(an.starts[e] for e in entries)
     report = [
