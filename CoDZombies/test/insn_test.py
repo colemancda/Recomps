@@ -55,8 +55,9 @@ GLUE = r'''
 #include <stdlib.h>
 uint8_t *g_mem;
 GuestFn *g_ftab; uint32_t g_ftab_base, g_ftab_size;
-uint32_t g_log[4096][2]; int g_nlog;
-void rt_log_store(uint32_t a, uint32_t n) { if (g_nlog < 4096) { g_log[g_nlog][0] = a; g_log[g_nlog][1] = n; g_nlog++; } }
+#define LOG_CAP (1 << 20)
+uint32_t g_log[LOG_CAP][2]; int g_nlog;
+void rt_log_store(uint32_t a, uint32_t n) { if (g_nlog < LOG_CAP) { g_log[g_nlog][0] = a; g_log[g_nlog][1] = n; g_nlog++; } }
 static void die(const char *w) { fprintf(stderr, "test: unexpected %s\n", w); abort(); }
 void rt_call_slow(CPU *c, uint32_t a) { (void)c; (void)a; die("call"); }
 void rt_jmp_slow(CPU *c, uint32_t a, uint32_t f) { (void)c; (void)a; (void)f; die("jump"); }
@@ -227,7 +228,8 @@ def main():
 
     samples = collections.defaultdict(list)
     unsupported = collections.Counter()
-    for e, (addrs, _, _) in bodies.items():
+    for e, body in bodies.items():
+        addrs = body[0]
         mode = an.starts[e]
         for a in addrs:
             ins = an.decode(a, mode)
@@ -272,7 +274,7 @@ def main():
     tfns = (ctypes.c_void_p * len(tests)).in_dll(so, "g_tests")
     proto = ctypes.CFUNCTYPE(None, ctypes.POINTER(CPU))
     nlog = ctypes.c_int.in_dll(so, "g_nlog")
-    glog = ((ctypes.c_uint32 * 2) * 4096).in_dll(so, "g_log")
+    glog = ((ctypes.c_uint32 * 2) * (1 << 20)).in_dll(so, "g_log")
     space = mmap.mmap(-1, (1 << 32) + PAGE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANON, prot=mmap.PROT_READ | mmap.PROT_WRITE)
     base = ctypes.addressof(ctypes.c_char.from_buffer(space))
     ctypes.c_void_p.in_dll(so, "g_mem").value = base
