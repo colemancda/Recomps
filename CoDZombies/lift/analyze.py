@@ -21,6 +21,10 @@ PC, LR, SP = arm.ARM_REG_PC, arm.ARM_REG_LR, arm.ARM_REG_SP
 MEDIA = re.compile(r"^(u|s|q|uq|uh|sh)(add|sub)(8|16)|^(u|s|q|uq|uh|sh)(asx|sax)|"
                    r"^(u|s)xta?b16|^usada?8|^sel|^(s|u)sat16|^pkh")
 BRANCH_TABLE = 0x65F80
+# The compiler's Thumb switch helper (ARM, reached with blx): the index is in r3,
+# a byte count N sits just before the return address and N + 1 bytes after it;
+# it jumps to lr + 2 * byte[min(r3, N)].
+SWITCH_HELPER = 0x25A71C
 
 
 class Analysis:
@@ -157,8 +161,34 @@ class Analysis:
                 if (w & 0x0F000000) != 0x0A000000:
                     break
                 out.append(t + 4 * len(out))
-            return out
+            if out:
+                return out
+            # add pc, pc, rX, lsl #2 into straight-line code (an unrolled loop
+            # entered part way, as in the division routines): any instruction of
+            # the run that follows can be the target.
+            sh = ops[2].shift
+            if sh.type == arm.ARM_SFT_LSL and sh.value == 2:
+                a = t
+                while len(out) < 256:
+                    x = self.decode(a, mode)
+                    if x is None or x.id == arm.ARM_INS_B or self.writes_pc(x) \
+                            or x.id in (arm.ARM_INS_BL, arm.ARM_INS_BLX):
+                        break
+                    out.append(a)
+                    a += 4
+            return out or None
         return None
+
+    def switch_table(self, ret):
+        """Targets, by index (the last is the default), of a call to SWITCH_HELPER
+        returning to ret: count byte at ret, table bytes from ret + 1."""
+        n = self.img.word(ret & ~3) >> (8 * (ret & 3)) & 0xFF
+        out = []
+        for k in range(n + 1):
+            p = ret + 1 + k
+            b = self.img.word(p & ~3) >> (8 * (p & 3)) & 0xFF
+            out.append(ret + 2 * b)
+        return out
 
     # --------------------------------------------------------------- body
     def track(self, ins, mode, known):
@@ -238,6 +268,11 @@ class Analysis:
                 if i in (arm.ARM_INS_BL, arm.ARM_INS_BLX) and ops and ops[0].type == arm.ARM_OP_IMM:
                     known.clear()
                     t = ops[0].imm
+                    if t == SWITCH_HELPER and mode == "thumb":
+                        jt = self.switch_table(nxt)
+                        tables[a] = jt
+                        work.extend(x for x in jt if not (self.starts.get(x) == mode and x != entry))
+                        break
                     tmode = mode if i == arm.ARM_INS_BL else ("thumb" if mode == "arm" else "arm")
                     if self.in_code(t & ~1) and self.stub_of(t) is None:
                         calls[t & ~1] = tmode
