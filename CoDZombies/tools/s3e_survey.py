@@ -102,17 +102,26 @@ def main():
             return (v, "arm")  # ARM functions start with an unconditional instruction
         return None
 
-    # A Thumb pointer to a function starting with push {..., lr} counts on its own;
+    # A pointer to a function starting with push {..., lr} (Thumb or ARM) counts on its own;
     # anything else only in a run of two or more code pointers (vtables, tables of
     # callbacks), so that stray constants aren't taken for code.
-    thumb_ptrs = table_ptrs = 0
+    thumb_ptrs = table_ptrs = rel_ptrs = 0  # thumb_ptrs: lone pointers to a push, either mode
+    def starts_with_push(c):
+        if c is None:
+            return None
+        a, mode = c
+        if mode == "thumb":
+            return c if ((img.half(a) or 0) & 0xFF00) == 0xB500 else None
+        return c if ((img.word(a) or 0) & 0xFFFF4000) == 0xE92D4000 else None
+
     for base, sz in data_ranges:
         cands = [(p, code_ptr(img.word(p))) for p in range(base, base + sz - 3, 4)]
         for k, (p, c) in enumerate(cands):
             if not c:
                 continue
             in_run = (k > 0 and cands[k - 1][1]) or (k + 1 < len(cands) and cands[k + 1][1])
-            pushes = c[1] == "thumb" and ((img.half(c[0]) or 0) & 0xFF00) == 0xB500
+            pushes = (c[1] == "thumb" and ((img.half(c[0]) or 0) & 0xFF00) == 0xB500) or \
+                     (c[1] == "arm" and ((img.word(c[0]) or 0) & 0xFFFF4000) == 0xE92D4000)
             if in_run:
                 add_func(c[0], c[1], "table")
                 table_ptrs += 1
@@ -265,28 +274,56 @@ def main():
                 a = nxt
         return r
 
-    while work:
-        start, mode = work.pop()
-        r = walk(start, mode)
-        if r is None:
-            src = funcs.pop(start)[1]
-            stats[f"rejected-{src}"] += 1
-            continue
-        seen.update(r["seen"])
-        stats.update(r["stats"])
-        r9_users += r["r9"]
-        indirect.update(r["indirect"])
-        vfp[mode] += r["vfp"]
-        stub_calls += r["stubs"]
-        for f in r["funcs"]:
-            add_func(*f)
+    def drain():
+        nonlocal stub_calls, r9_users
+        while work:
+            start, mode = work.pop()
+            r = walk(start, mode)
+            if r is None:
+                src = funcs.pop(start)[1]
+                stats[f"rejected-{src}"] += 1
+                continue
+            seen.update(r["seen"])
+            stats.update(r["stats"])
+            r9_users += r["r9"]
+            indirect.update(r["indirect"])
+            vfp[mode] += r["vfp"]
+            stub_calls += r["stubs"]
+            for f in r["funcs"]:
+                add_func(*f)
+
+    drain()
+
+    # After the walk: self-relative pointer tables (the C++ static constructor list: entry
+    # address + word = function). Accepted as a run of eight or more code
+    # pointers, or of three or more of which at least half start with
+    # push {..., lr}: short runs come from random data far too often.
+    for base, sz in data_ranges:
+        cands = [code_ptr((p + (img.word(p) or 0)) & 0xFFFFFFFF) if img.word(p) else None
+                 for p in range(base, base + sz - 3, 4)]
+        k = 0
+        while k < len(cands):
+            if not cands[k]:
+                k += 1
+                continue
+            j = k
+            while j < len(cands) and cands[j]:
+                j += 1
+            run = cands[k:j]
+            if len(run) >= 8 or (len(run) >= 3 and sum(1 for c in run if starts_with_push(c)) * 2 >= len(run)):
+                for c in run:
+                    if c[0] not in seen:   # the walk already decided what's there
+                        add_func(c[0], c[1], "relative")
+                        rel_ptrs += 1
+            k = j
+    drain()
 
     code_bytes = code_hi - lo
     covered = sum(1 for v in seen.values() if v != "table")
     modes = collections.Counter(funcs[f][0] for f in funcs)
     srcs = collections.Counter(funcs[f][1] for f in funcs)
     print(f"game code {lo:#x}-{code_hi:#x} ({code_bytes} bytes); stubs from {stubs_lo:#x}")
-    print(f"functions {len(funcs)}: {dict(modes)}; found by {dict(srcs)} ({table_ptrs} table words, {thumb_ptrs} lone Thumb pointers)")
+    print(f"functions {len(funcs)}: {dict(modes)}; found by {dict(srcs)} ({table_ptrs} table words, {thumb_ptrs} lone pointers, {rel_ptrs} relative)")
     print(f"instructions: arm {stats['arm']}, thumb {stats['thumb']}; bytes covered {covered} "
           f"({100 * covered / code_bytes:.1f}% of game code)")
     rej = {k[9:]: v for k, v in stats.items() if k.startswith("rejected-")}
