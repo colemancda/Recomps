@@ -33,6 +33,7 @@ directory (default `save/`).
 | `gl.c`, `gl_real.c` | s3eGL, EGL and the GL backends |
 | `pvrtc.c` | PVRTC decoding for desktop GL |
 | `input.c` | pointer events and scripted taps |
+| `sound.c` | s3eSound (channels, a mixer calling the game's callbacks, AudioQueue output) and s3eAudio |
 | `../ios/app.m` | the iOS app: game thread, EAGL view, touches |
 
 ## Things the game expects from the loader
@@ -167,7 +168,9 @@ Bringing the game up exposed control flow the static passes had missed:
 | `0x27120` | s3eFileDelete | |
 | `0x29b54` | s3eFileAddUserFileSys | see "Asset archives" |
 | `0x189b0`, `0x18638`, `0x18424` | s3eCompressionDecompInit / Read / Final | see "Compression" |
-| `0x1f068` | s3eDeviceYield | clamps the ms argument, then runs the event loop; returns at once for now |
+| `0x1f068` | s3eDeviceYield | delivers input, mixes sound ahead, and sleeps: up to ms (at most 100), or 0.5 ms when the game is spinning on it (see "Frame pacing") |
+| `0x34d94`… | s3eSound | 14 functions; see "Sound" |
+| `0x11964`… | s3eAudio | 8 functions, all idle so far; see "Sound" |
 | `0x398bc` | s3eSurfaceGetInt | width, height, pitch, pixel types, device size, blit directions; see "Screen". First taken for s3eSoundGetInt, which made the screen 256×22050 |
 | `0x3a964` | timer function | 1 for 0, else a Timer error and −1 (`0x4fda0`) |
 | `0x1dea8`, `0x1deb0` | compiled-out debug checks | 0 |
@@ -297,12 +300,76 @@ holds the original executable as `kiwi` (the loader reads its segments), the
 In the iOS 26.5 simulator (iPhone 17) the game shows its splash screens and
 the title screen, and ordinary taps take it through the main menu,
 single-player menu and level select into Nacht der Untoten, which plays
-("Round 1", HUD, sticks, weapon). Screens change a few seconds after a tap;
-with other heavy work on the Mac at the same time, much later (the game's
-busy loop competes for the CPU).
+("Round 1", HUD, sticks, weapon), with sound through an AudioQueue.
 
 `./build.sh ios` compiles and links the device app as well; it hasn't run on
 a device yet.
+
+## Sound
+
+The s3eSound stubs (`0x2bde64`–`0x2bdf90`) are in alphabetical order:
+ChannelGetInt `0x34d94`, ChannelPause `0x35d70`, ChannelPlay `0x35ba8`,
+ChannelRegister `0x35a14`, ChannelResume `0x35cc0`, ChannelSetInt `0x34c14`,
+ChannelStop `0x34778`, ChannelUnRegister `0x35834`, GetError and
+GetErrorString (generic), GetFreeChannel `0x348ec`, GetInt `0x34a20`,
+Pause/ResumeAllChannels `0x34898`/`0x34864`, SetInt `0x34928`,
+StopAllChannels `0x34828`. The loader's own code confirms each: ChannelPlay
+takes five arguments and reports "Play Sample" failures, ChannelRegister
+checks callback ids, the void ones are the "all channels" calls. Sound
+properties: 0 volume, 1 default rate, 2 output rate, 3 channels, 4 the mask
+of busy channels, 5 available, 6 default volume. Channel properties: 0 pitch
+(8.8), 1 rate, 2 user variable, 3 volume, 4 status, 5 paused. s3eAudio
+(music files) sits among other stubs: GetInt `0x11a38`, IsCodecSupported
+`0x11964`, IsPlaying `0x11c04`, Pause `0x11efc`, Play `0x11da8`, Resume
+`0x11bc8`, SetInt `0x11c40`, Stop `0x11b90`, with Register/UnRegister in
+the generic callback registry. The game hasn't called s3eAudioPlay yet.
+
+The game (IwSound) registers two callbacks on all 16 channels:
+S3E_CHANNEL_GEN_AUDIO (1) at `0x1638c8` and S3E_CHANNEL_END_SAMPLE (0) at
+`0xd5934`. GEN_AUDIO makes the channel's audio itself (it decodes the
+sample, which for the menu music is 4-bit ADPCM: 244,736 sample words play
+for 44 s, resamples by the channel's rate and applies its volume) into a
+buffer it is handed, with `s3eSoundGenAudioInfo`:
+
+| offset | field |
+|---|---|
+| `0x00` | channel |
+| `0x04` | `int16 *target` |
+| `0x08` | samples wanted |
+| `0x0c` | mix (add to the target) |
+| `0x10`, `0x14`, `0x18` | the sample's start, length, repeat count |
+| `0x1c` | end (a byte the callback sets when the sample is done) |
+
+END_SAMPLE gets `{channel, repsRemaining}` and returns 0 to let it stop.
+
+`runtime/sound.c` mixes on the game thread, from s3eDeviceYield: it keeps
+2048 samples (93 ms) mixed ahead of what the output has played, calling each
+playing channel's GEN_AUDIO callback in mix mode into one 22050 Hz mono
+buffer, and END_SAMPLE when a channel finishes. Guest code so never runs on
+two threads (on the iPhone the loader called these from its audio thread). A
+channel without a GEN_AUDIO callback would play its 16-bit samples directly.
+The output is an AudioQueue on the Mac and iOS, fed from a ring buffer; on
+the host it is off unless `RT_SOUND=1`, and mixing then follows the clock so
+that samples still end and channels free up. `RT_SOUND_DUMP=f.wav` writes
+the mix to a file (that's how it was checked: music in the menus, effects
+in the level), and `RT_LOG_SOUND=1` logs channel calls.
+
+## Frame pacing
+
+The game waits for its next frame at `0x12c794` by calling s3eDeviceYield(0)
+and the millisecond timer in a loop until the frame's time has passed (about
+1,400 times a frame). Yields in a row with nothing but the timer between them
+are that wait, so the fourth one onwards sleeps half a millisecond; any other
+import resets the count, so loading, which yields between file reads, isn't
+slowed. A minute on the Mac went from 44 s of CPU to 1.6 s with the same
+frame count. Once a frame the game also calls s3eDeviceYield(-2^31), which
+doesn't sleep.
+
+`guest_call` restores r0–r12, sp and lr after a callback. It used to keep only
+the callee-saved registers, and s3eDeviceYield, reading its argument after the
+sound callbacks had run, took a callback's return value (256) for a time to
+sleep, which made the game crawl. `RT_FRAME_LOG=n` logs every nth frame
+(default 600).
 
 ## Screen
 
@@ -340,21 +407,19 @@ through the main menu, the single-player menu and level select, loads Nacht
 der Untoten (its sound, environment, shared and dynamics groups and the
 `ingame/` groups: effects, zombies, player, characters, cameras) and plays
 it: the level, HUD and weapon draw correctly, and with nobody playing the
-zombies win and it shows "Game Over: You Have Survived 1 Round". A five-minute
-run makes about 13,000 frames, about 44 a second. The game paces itself by
-calling s3eDeviceYield(0) and s3eTimerGetMs in a busy loop, about 1,400 times
-a frame.
+zombies win and it shows "Game Over: You Have Survived 1 Round". Sound plays
+through it: music in the menus, effects in the level. A minute takes about
+1.6 s of CPU on the Mac.
 
 Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
 `0x1fd7c`, s3eKeyboard `0x2ba58`, `0x2bae8`, `0x2bd38`, s3eMemory `0x2f7a8`,
-`0x2f838`, `0x2fdb8`, s3eSocket `0x30d88`, s3eSound `0x34a20`, s3eTimer
-`0x3ac5c` and `0x3b064`, s3eVideo `0x3ba74`.
+`0x2f838`, `0x2fdb8`, s3eSocket `0x30d88`, s3eTimer `0x3ac5c` and
+`0x3b064`, s3eVideo `0x3ba74`.
 
 Next:
 
-- **Device and timer callbacks** (suspend and resume, s3eTimer `0x3ac5c`),
-  and a yield that sleeps instead of the busy loop.
-- **Sound**: nothing plays yet (s3eSound, the sound groups are loaded).
+- **Device and timer callbacks** (suspend and resume, s3eTimer `0x3ac5c`).
+- **s3eAudio** (music files) when the game first asks for it.
 - **On a device.** The 4 GB guest reservation may need the extended virtual
   addressing entitlement, and the app needs signing.
 - **Drawing at the screen's resolution** instead of scaling up 480×320
