@@ -20,9 +20,7 @@ routine (ARM) aligns the stack, then calls the constructor at `0x250e39`
 (Thumb), the main path at `0x67944` (Thumb) and a final routine at `0x708d8`.
 The `XE3U` header at the start of `s3e_data` holds sizes and offsets of the
 image, not further entry points. Every other entry into the game is a function
-pointer the game hands over at run time: device, keyboard, pointer, timer and
-sound callbacks. The loader's path for calling those back hasn't been found
-statically yet (see "Open").
+pointer the game hands over at run time (see "Callbacks").
 
 **Out of the game.** All of it goes through 809 stubs at the end of
 `s3e_code`, 0x2ba6b0–0x2be5d0, 20 bytes each:
@@ -35,13 +33,13 @@ stub:     e59fc000  ldr ip, [pc]      ; ip = implementation in __text
           4778 46c0 bx pc ; nop       ; Thumb entry of the following stub
 ```
 
-ARM callers `bl` the stub. Thumb callers `bl` to the 4 bytes before it. Game
-code also reaches 251 of them through a table of ARM `b` instructions at
-0x65f80–0x6636c. Apart from the 20 data exports described below, no other path
-into the loader was found: no stub address is stored as data. A full
-recursive-descent disassembly is still needed to rule out `svc` or computed
-jumps; the linear sweep's `svc` hits are probably data and Thumb code misread
-as ARM.
+Game code never branches to a stub directly. It calls entries of a table of
+251 ARM `b` instructions at 0x65f80–0x6636c (`bl` from ARM, `blx` from Thumb),
+and each entry branches to one stub. The recursive-descent survey
+(`tools/s3e_survey.py`) finds no other branch into the stubs, no `svc` in
+reached code, and no stub address stored as data. Apart from the 20 data
+exports described below, that table is the game's only way out. The call-site
+counts below are calls to table entries.
 
 ## Trampolines
 
@@ -70,6 +68,41 @@ For the recompiled build, the trampoline gives each import its return width
 and whether it takes stack arguments, which is enough to generate the
 lifted-code side of every import. Exact argument counts need the s3e headers
 or a look at each implementation.
+
+## Callbacks
+
+The loader calls into the game through one routine, `0x37da0`, which has 59
+call sites in `__text`:
+
+```
+call_game(fn, a0, a1, a2, a3, a4, a5, a6)  ->  fn(a0, ..., a6)
+```
+
+That's four register arguments and three on the stack, with r0:r1 returned.
+If the loader is on its own stack (`0x393a4` != 0), it switches to the game's
+saved stack, sets r4–r11 to zero (r9 included) and `bx`s to `fn`, so
+interworking picks ARM or Thumb from bit 0. Otherwise it calls `fn` on the
+current stack. Callers by subsystem:
+
+| subsystem | call sites | what calls back |
+|---|---|---|
+| s3eFile | 46 | user file systems: the game registers one for its `.dz` derbh archives, so file operations on those paths run game code |
+| s3eCallbacks | 5 | the device callback registry (`Invalid callback ID`, `callback %p is already registered on device %d`) used by keyboard, pointer, device and sound events |
+| s3eCompression | 3 | user decompression callbacks |
+| s3eMemory | 3 | user allocator hooks |
+| s3eTimer | 1 | `s3eTimerSetTimer` callbacks; the timer table is 32 × 16 bytes at `0xa0c4d0` (due time, function, user data), and the dispatcher at 0x3a9a0 calls `fn(0, userdata)` |
+
+For the recompiled build, a callback is a guest address that has to be looked
+up in the lifted code's function table (ARM or Thumb by bit 0) and called with
+up to 7 arguments.
+
+## r9
+
+The game uses r9 as an ordinary callee-saved register: it's pushed and popped
+with r4–r11 and used for arithmetic, with 12.7k instructions touching it and
+6k writing it. It isn't a static base. The loader zeroes it on every callback
+and restores its own r9 in every trampoline. A lifter can treat r9 like
+r4–r8.
 
 ## Kinds of stub
 
@@ -100,33 +133,42 @@ call sites in all.
 |---|---|---|---|
 | OpenGL ES | 223 | 98 | 538 |
 | s3eFile | 28 | 16 | 290 |
+| s3eDebug | 21 | 13 | 178 |
 | s3eSocket | 22 | 22 | 172 |
 | s3eTimer | 14 | 5 | 157 |
 | s3eConfig | 4 | 2 | 138 |
-| s3eDebug | 16 | 11 | 90 |
-| s3eCrypto? | 11 | 2 | 88 |
-| s3eDevice | 47 | 6 | 72 |
+| s3eDevice / s3eError | 47 | 6 | 72 |
 | s3eSound | 41 | 10 | 62 |
 | s3eMemory | 20 | 13 | 51 |
 | s3eSecureStorage? | 5 | 5 | 50 |
 | s3eSurface | 6 | 6 | 37 |
-| s3eGL / EGL | 31 | 13 | 32 |
+| s3eGL / EGL (iOS layer) | 31 | 13 | 32 |
 | s3eKeyboard | 7 | 6 | 30 |
-| s3eAudio | 22 | 10 | 29 |
 | unknown (0x45b04–0x47e40) | 6 | 6 | 28 |
-| s3eDevice callbacks | 5 | 3 | 18 |
+| s3eGL? | 5 | 3 | 18 |
 | s3eAccelerometer | 8 | 8 | 18 |
+| s3eAudio | 7 | 5 | 18 |
+| s3eCallbacks | 15 | 5 | 11 |
 | s3eCompression | 4 | 4 | 8 |
 | s3ePointer | 1 | 1 | 4 |
 | s3eLicense | 3 | 1 | 2 |
 | s3eVideo | 3 | 1 | 2 |
+| s3eCrypto | 6 | 0 | 0 |
 | s3eExt | 1 | 0 | 0 |
 
 Subsystem names come from address ranges in `__text`. Marmalade's sources are
-linked alphabetically, and each range is anchored by the strings its functions
-use, such as `Invalid s3eFile handle %p`, `Invalid s3eSocket handle %p`,
+linked alphabetically. The `Disable<Subsystem>` config keys list every one:
+Accelerometer, Audio, Callbacks, Camera, Compression, Config, Crypto, Debug,
+Device, Error, Ext, Fibre, File, GL, Keyboard, License, Memory, Pointer,
+SecureStorage, Socket, Sound, Surface, Timer, Vibra, Video. Each range is
+anchored by the strings its functions use, such as `Invalid s3eFile handle %p`, `Invalid s3eSocket handle %p`,
 `Invalid channel: %d` (sound) and `Maximum number of active timers reached`.
-The boundaries between anchors, and names marked `?`, are guesses. The binary
+The boundaries between anchors, and names marked `?`, are guesses. The
+0x12000–0x16f00 block between Audio and Callbacks is a bignum library
+(`bint_*`, axTLS style) with no API entries. Debug starts at 0x1dea8,
+right after Crypto's SHA-1 constants. Its two most-called entries, 0x1dea8
+(19 calls) and 0x1deb0 (69 calls), are `return 0`, so some debug feature is
+compiled out. The binary
 has no symbols, codwawzpc (a touchHLE fork) emulates the iOS layer and never
 names s3e functions, and no Marmalade SDK was found on disk. Per-function
 names need the SDK's `s3e*.h`.
@@ -148,13 +190,6 @@ names need the SDK's `s3e*.h`.
 
 ## Open
 
-- The loader's callback path into game code: which code calls the function
-  pointers the game registers, with which stack and r9. To find out, trace
-  under Bridge32 or follow `s3eTimerSetTimer`'s (0x3ac5c) stored pointer.
-- What r9 means to the game. The trampolines restore the loader's r9, and
-  the log says `main thread r9 = 0`, so the game may not use r9 at all.
 - Per-function names and signatures for the ~150 called s3e functions.
-- Thumb vs ARM split of `s3e_code`. The start routine and the stubs are ARM;
-  the constructor and main path it calls are Thumb-1 (armv6). How much of
-  the rest is Thumb isn't measured yet. The lifter needs both modes and
-  interworking.
+- Which callback signatures each registering API uses: how many of the seven
+  arguments are real, and what's returned.
