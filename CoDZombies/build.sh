@@ -85,11 +85,14 @@ echo "compiled $(ls "$out"/*.o | wc -l | tr -d ' ') lifted objects into $out ($(
 
 # The runtime (always rebuilt; it's small) and, for the host, the program.
 rt_flags=(-O1 -g -Wall -Wextra -Wno-unused-parameter -DRT_DYNAMIC_BASE -Iruntime -Ibuild/gen)
+# liblzma (xz) for the derbh archives' LZMA streams: Homebrew's on the host
+lzma_prefix="${LZMA_PREFIX:-/opt/homebrew}"
+[ "$target" = host ] && rt_flags+=(-I"$lzma_prefix/include")
 mkdir -p "$out/runtime"
 for src in runtime/*.c; do
     "${cc[@]}" "${rt_flags[@]}" -c "$src" -o "$out/runtime/$(basename "${src%.c}").o"
 done
 if [ "$target" = host ]; then
-    "${cc[@]}" -o build/codz-host "$out"/*.o "$out"/runtime/*.o
+    "${cc[@]}" -o build/codz-host "$out"/*.o "$out"/runtime/*.o -lz "$lzma_prefix/lib/liblzma.a"
     echo "linked build/codz-host"
 fi
