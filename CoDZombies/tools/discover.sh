@@ -16,7 +16,7 @@ extra="$here/extra_funcs.tsv"
 
 lifted="$here/build/extra_funcs.lifted"   # the starts the current build was lifted with
 for ((k = 1; k <= rounds; k++)); do
-    (cd build && RT_EXTRA_FUNCS="$extra" RT_MISSING=zero RT_LOG_IMPORTS=1 ./codz-host ../orig/Payload/kiwi.app > run.log 2>&1)
+    (cd build && RT_LOG_LIMIT=${RT_LOG_LIMIT:-80000} RT_EXTRA_FUNCS="$extra" RT_MISSING=zero RT_LOG_IMPORTS=1 timeout 300 ./codz-host ../orig/Payload/kiwi.app > run.log 2>&1)
     status=$?
     [ -f "$extra" ] && sort -u "$extra" -o "$extra"
     if cmp -s "$extra" "$lifted" || [ ! -f "$extra" ]; then
