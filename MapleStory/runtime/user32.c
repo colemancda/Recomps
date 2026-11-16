@@ -206,6 +206,18 @@ int rt_post_message(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lpara
     return ok;
 }
 
+/* Whether the calling thread has queued (posted/sent) window messages waiting.
+ * MsgWaitForMultipleObjects uses this so a posted message (e.g. a WSAAsyncSelect
+ * FD_READ socket notification) wakes the main loop, not just raw input. */
+int rt_messages_pending(CPU *c) {
+    RtThread *th = rt_thread_of(c);
+    pthread_mutex_lock(&user_mu);
+    MsgQueue *q = th->msgq;
+    int has = q && q->count > 0;
+    pthread_mutex_unlock(&user_mu);
+    return has;
+}
+
 /* Calls a window procedure. Returns 0 if a non-local return passed through (see rt_call_guest). */
 static int call_proc(CPU *c, uint32_t proc, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp, uint32_t *res) {
     uint32_t args[4] = {hwnd, msg, wp, lp};

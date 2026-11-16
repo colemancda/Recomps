@@ -133,7 +133,7 @@ H(ex_MsgWaitForMultipleObjects) {
      * report WAIT_OBJECT_0 + nCount so the game pumps its message loop
      * (PeekMessage -> TranslateMessage -> DispatchMessage). This is how
      * MapleStory's main loop learns a keystroke or click is waiting. */
-    if (a[4] && rt_input_pending()) return a[0];
+    if (a[4] && (rt_input_pending() || rt_messages_pending(c))) return a[0];
     return 0x102; /* WAIT_TIMEOUT */
 }
 

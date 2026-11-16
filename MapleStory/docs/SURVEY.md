@@ -459,3 +459,41 @@ Caveat: filling the **Password** field still relies on the local
 dispatch that would move focus between fields is still broken (see above). The ID
 field fills natively. Next steps: handle the `licenseAgreement` step to reach
 world/character select, and fix the real click→focus + field/button render.
+
+## Login → world select works end to end against the real server
+
+Two fixes took the recompiled client from "login screen" to the **world-select
+screen**, driven entirely by `colemancda/maplestory`'s `MapleStoryServer62`:
+
+1. **`MsgWaitForMultipleObjects` must wake on posted messages, not just input.**
+   The earlier fix returned `WAIT_OBJECT_0 + nCount` only when raw input was
+   queued. But the client receives socket data through `WSAAsyncSelect`, which
+   `rt_post_message`s an `FD_READ` window message when the server replies. With
+   the main loop only waking on input, the client sent the login but never woke to
+   read the response. Added `rt_messages_pending(CPU*)` (runtime/user32.c) and
+   made `MsgWaitForMultipleObjects` also return `nCount` when the thread's message
+   queue is non-empty (runtime/extra.c). Now the client pumps the `FD_READ`,
+   reads the reply, and advances.
+
+2. **Server (`autoregister`) now accepts the EULA for new accounts** so a fresh
+   login does not stop at `licenseAgreement` (a dev-only change on the
+   autoregister path).
+
+Full observed flow (server log):
+
+```
+Recieved packet loginRequest (49 bytes)  -> Login - heroNNNN -> Registered User
+Send: success(username: "heroNNNN")       (client reads it)
+Recieved packet serverListRequest (2 bytes)
+Send: world(... "Scania", 20 channels ...) + serverList end
+```
+
+The recompiled client then renders the **"Select a world/channel"** screen with
+the Scania world banner. So login and the world-list exchange are complete; the
+client reaches world select.
+
+Caveat unchanged: filling the Password field and submitting still use the local
+`RECOMP_LOGIN_INJECT` focus hook (gitignored `build/gen`), because the UI
+click→focus dispatch and the field/button text render are still the open
+lifted-code bugs. Next: select a channel (needs the same click fix) → character
+list / world entry.
