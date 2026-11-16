@@ -66,6 +66,8 @@ class FunctionContext:
 
     def call(self, t, ret, from_thumb, tmode):
         em = self.em
+        if t == analyze.SWITCH_HELPER and from_thumb and self.ins.address in self.tables:
+            return self.switch_helper(ret)
         lr = "c->r[14] = 0x%08xu;" % (ret | (1 if from_thumb else 0))
         stub = em.an.stub_of(t)
         if stub is not None:
@@ -77,6 +79,24 @@ class FunctionContext:
             return "%s f_%08x(c); %s" % (lr, t, self.check_ret(ret))
         em.stats["calls_unknown"] += 1
         return "%s rt_call(c, 0x%08xu); %s" % (lr, t | (1 if tmode == "thumb" else 0), self.check_ret(ret))
+
+    def switch_helper(self, ret):
+        """blx to the switch helper: its register effects, then a switch on the index."""
+        em = self.em
+        em.stats["jump_tables"] += 1
+        jt = self.tables[self.ins.address]
+        n = len(jt) - 1
+        cases = []
+        for k, t in enumerate(jt):
+            if t in self.bodyset:
+                self.labels.add(t)
+                cases.append("case %d: goto L_%08x;" % (k, t))
+            else:
+                cases.append("case %d: %s" % (k, self.branch(t)))
+        offs = ", ".join(str((t - ret) // 2) for t in jt)
+        return ("{ static const uint8_t b_[] = {%s}; uint32_t i_ = c->r[3]; sub_nzcv(c, i_, %du, 1); "
+                "if (i_ > %du) i_ = %du; c->r[3] = b_[i_]; c->r[14] = 0x%08xu; c->r[12] = 0x%08xu + 2 * b_[i_]; "
+                "switch (i_) { %s } }" % (offs, n, n, n, ret | 1, ret | 1, " ".join(cases)))
 
     def icall(self, expr, ret, from_thumb):
         t = self.consts.get(self.ins.address)
@@ -181,7 +201,9 @@ class Emitter:
         if i == arm.ARM_INS_B:
             return cond
         if i in (arm.ARM_INS_BL, arm.ARM_INS_BLX):
-            return True
+            # a call to the switch helper doesn't come back: its table follows
+            return not (ins.operands and ins.operands[0].type == arm.ARM_OP_IMM
+                        and ins.operands[0].imm == analyze.SWITCH_HELPER and self.mode_of(ins) == "thumb")
         if self.an.writes_pc(ins):
             return cond or self.an.is_indirect_call(ins, self.mode_of(ins))
         return True
