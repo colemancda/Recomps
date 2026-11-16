@@ -43,9 +43,10 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   `docs/LIFTER.md`.
 - The runtime (`runtime/`, `docs/RUNTIME.md`) runs the lifted game headless on
   this Mac (`./build.sh host`). It decrypts the game's data as Marmalade's
-  loader does, reads the embedded config and answers 23 identified s3e
-  functions. The game gets through its constructors, memory setup and
-  configuration, and opens `_main.dz`. It then fails to find `console.bin` in
-  its asset archive, which is the next thing to fix.
+  loader does, reads the embedded config and answers 39 identified s3e
+  functions, among them files, the game's own archive file system and LZMA
+  decompression. The game loads its bootstrap data, localisation and
+  achievement groups and writes its save files. It then falls back to software
+  texture pages because GL isn't there yet, which is the next piece.
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
