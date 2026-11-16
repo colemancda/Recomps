@@ -126,7 +126,7 @@ for src in runtime/*.c "$lzma_dir/LzmaDec.c"; do
 done
 if [ "$target" = host ]; then
     "${cc[@]}" -o build/codz-host "$out"/*.o "$out"/runtime/*.o -lz \
-        -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation
+        -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation -framework AudioToolbox
     echo "linked build/codz-host"
 else
     # The app: ios/app.m around the runtime, the original executable (the
@@ -136,7 +136,8 @@ else
     mkdir -p "$app"
     "${cc[@]}" "${rt_flags[@]}" -fobjc-arc -c ios/app.m -o "$out/runtime/app.o"
     "${cc[@]}" -o "$app/CoDZombies" "$out"/*.o "$out"/runtime/*.o -lz \
-        -framework UIKit -framework OpenGLES -framework QuartzCore -framework CoreGraphics -framework Foundation
+        -framework UIKit -framework OpenGLES -framework QuartzCore -framework CoreGraphics -framework Foundation \
+        -framework AudioToolbox
     cp ios/Info.plist "$app/Info.plist"
     platform=iPhoneOS
     [ "$target" = sim ] && platform=iPhoneSimulator
