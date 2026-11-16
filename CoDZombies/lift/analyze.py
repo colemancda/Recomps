@@ -24,7 +24,7 @@ BRANCH_TABLE = 0x65F80
 
 
 class Analysis:
-    def __init__(self, exe, funcs_tsv):
+    def __init__(self, exe, funcs_tsv, extra_tsv=None):
         self.img = img = Image(exe)
         self.lo, size = img.sections["s3e_code"]
         self.hi = self.lo + size
@@ -55,6 +55,16 @@ class Analysis:
                 a = int(addr, 16)
                 if a not in self.table:
                     self.starts[a] = mode
+        # Function starts the runtime reached but the survey didn't find
+        # (runtime/dispatch.c appends them: address and mode).
+        if extra_tsv and os.path.exists(extra_tsv):
+            with open(extra_tsv) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and not parts[0].startswith("#"):
+                        a = int(parts[0], 16)
+                        if self.in_code(a) and a not in self.table:
+                            self.starts.setdefault(a, parts[1])
 
     # ------------------------------------------------------------ queries
     def in_code(self, a):
@@ -108,6 +118,17 @@ class Analysis:
         except capstone.CsError:
             return False
 
+    def is_indirect_call(self, ins, mode):
+        """A write to pc right after `mov lr, pc`: an ARM indirect call that
+        returns to the next instruction."""
+        if mode != "arm" or ins.id in (arm.ARM_INS_BL, arm.ARM_INS_BLX):
+            return False
+        p = self.decode(ins.address - 4, mode)
+        return (p is not None and p.id == arm.ARM_INS_MOV and len(p.operands) == 2
+                and p.operands[0].type == arm.ARM_OP_REG and p.operands[0].reg == LR
+                and p.operands[1].type == arm.ARM_OP_REG and p.operands[1].reg == PC
+                and p.cc in (arm.ARM_CC_AL, arm.ARM_CC_INVALID))
+
     def jump_table(self, ins, mode, body_addrs=None):
         """Targets of an ARM jump table at ins, or None if ins isn't one."""
         if mode != "arm":
@@ -140,15 +161,53 @@ class Analysis:
         return None
 
     # --------------------------------------------------------------- body
+    def track(self, ins, mode, known):
+        """Constants in registers along straight-line code: literal-pool loads from
+        the (read-only) image and pc-relative adds, as in PIC veneers
+        (ldr r3, [pc, #4]; add r3, pc, r3; bx r3) and interworking veneers
+        (add ip, pc, #1; bx ip)."""
+        ops = ins.operands
+        try:
+            written = ins.regs_access()[1]
+        except Exception:
+            written = []
+        val = None
+        if ins.id == arm.ARM_INS_LDR and len(ops) == 2 and ops[1].type == arm.ARM_OP_MEM \
+                and ops[1].mem.base == PC and ops[1].mem.index == 0 and ins.cc in (arm.ARM_CC_AL, arm.ARM_CC_INVALID):
+            disp = -ops[1].mem.disp if ops[1].subtracted else ops[1].mem.disp
+            lit = (ins.address + 8 if mode == "arm" else (ins.address + 4) & ~3) + disp
+            if self.lo <= lit < self.hi:
+                val = self.img.word(lit)
+        elif ins.id == arm.ARM_INS_ADD and len(ops) == 3 and ops[1].type == arm.ARM_OP_REG \
+                and ops[1].reg == PC and ops[2].type == arm.ARM_OP_IMM and ins.cc in (arm.ARM_CC_AL, arm.ARM_CC_INVALID):
+            # add ip, pc, #1; bx ip: an ARM-to-Thumb veneer continuing at the next instruction
+            base = ins.address + 8 if mode == "arm" else (ins.address + 4) & ~3
+            val = (base + ops[2].imm) & 0xFFFFFFFF
+        elif ins.id == arm.ARM_INS_ADD and len(ops) == 3 and ops[1].type == arm.ARM_OP_REG \
+                and ops[2].type == arm.ARM_OP_REG and not ops[2].shift.type and ins.cc in (arm.ARM_CC_AL, arm.ARM_CC_INVALID):
+            pcv = ins.address + (8 if mode == "arm" else 4)
+            a, b = ops[1].reg, ops[2].reg
+            va = pcv if a == PC else known.get(a)
+            vb = pcv if b == PC else known.get(b)
+            if va is not None and vb is not None and (a == PC or b == PC):
+                val = (va + vb) & 0xFFFFFFFF
+        for r in written:
+            known.pop(r, None)
+        if val is not None and ops and ops[0].type == arm.ARM_OP_REG:
+            known[ops[0].reg] = val
+
     def body(self, entry):
-        """(sorted instruction addresses, {addr: jump-table targets}, new call targets)."""
+        """(sorted instruction addresses, {addr: jump-table targets}, new call
+        targets, {addr: constant target of a bx/blx through a register})."""
         mode = self.starts[entry]
         seen = set()
         tables = {}
         calls = {}
+        consts = {}
         work = [entry]
         while work:
             a = work.pop()
+            known = {}
             while self.in_code(a) and a not in seen:
                 if a != entry and a in self.starts:
                     break  # fall-through or branch into another function: tail call
@@ -159,6 +218,13 @@ class Analysis:
                 nxt = a + ins.size
                 i, ops = ins.id, ins.operands
                 cond = ins.cc not in (arm.ARM_CC_AL, arm.ARM_CC_INVALID)
+                if i in (arm.ARM_INS_BX, arm.ARM_INS_BLX) and ops and ops[0].type == arm.ARM_OP_REG \
+                        and ops[0].reg in known:
+                    t = known[ops[0].reg]
+                    if self.in_code(t & ~1) and self.stub_of(t & ~1) is None:
+                        consts[a] = t
+                        calls[t & ~1] = "thumb" if t & 1 else "arm"
+                self.track(ins, mode, known)
                 if i == arm.ARM_INS_B:
                     t = ops[0].imm
                     if self.in_code(t) and not (t in self.starts and t != entry):
@@ -168,6 +234,7 @@ class Analysis:
                         continue
                     break
                 if i in (arm.ARM_INS_BL, arm.ARM_INS_BLX) and ops and ops[0].type == arm.ARM_OP_IMM:
+                    known.clear()
                     t = ops[0].imm
                     tmode = mode if i == arm.ARM_INS_BL else ("thumb" if mode == "arm" else "arm")
                     if self.in_code(t & ~1) and self.stub_of(t) is None:
@@ -175,6 +242,9 @@ class Analysis:
                     a = nxt
                     continue
                 if self.writes_pc(ins) and i != arm.ARM_INS_BLX:
+                    if self.is_indirect_call(ins, mode):
+                        a = nxt
+                        continue
                     jt = self.jump_table(ins, mode)
                     if jt:
                         tables[a] = jt
@@ -184,7 +254,7 @@ class Analysis:
                         continue
                     break
                 a = nxt
-        return sorted(seen), tables, calls
+        return sorted(seen), tables, calls, consts
 
     def all_functions(self):
         """Walk every function, adding call targets as new starts until none are new."""
