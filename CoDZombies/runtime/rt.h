@@ -24,6 +24,10 @@
 #define SCREEN_W 480
 #define SCREEN_H 320
 
+/* Runs the game (main.c): app holds "kiwi" and the archives, save is writable.
+ * Returns when the game's start routine does. */
+int codz_run(const char *app_dir, const char *save_dir);
+
 /* ------------------------------------------------------------- logging */
 extern int g_log_imports;   /* RT_LOG_IMPORTS: log every import call */
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -82,7 +86,7 @@ void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data);
 
 /* --------------------------------------------------------------- input */
 /* A pointer event, queued until the next s3eDeviceYield: kind 0 button
- * (pressed 1 or 0), 1 motion; screen coordinates. */
+ * (pressed 1 or 0), 1 motion; screen coordinates. Any thread may call it. */
 void input_pointer(int kind, int pressed, int32_t x, int32_t y);
 void input_deliver(CPU *c);         /* s3eDeviceYield */
 void input_frame(uint32_t frame);   /* eglSwapBuffers: scripted taps (RT_TAPS) */
