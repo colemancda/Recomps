@@ -57,7 +57,11 @@ extern const ImportImpl g_s3e_impls[];       /* s3e.c */
 extern const uint32_t g_s3e_impl_count;
 extern const ImportImpl g_compress_impls[];  /* compress.c */
 extern const uint32_t g_compress_impl_count;
+extern const ImportImpl g_gl_impls[];        /* gl.c: s3eGL, EGL */
+extern const uint32_t g_gl_impl_count;
 void imports_init(void);
+/* Stub address of the GL import with this name, or 0. */
+uint32_t import_stub_by_name(const char *name);
 
 /* Arguments of an import: r0-r3, then the guest stack. */
 static inline uint32_t arg(CPU *c, int n) { return n < 4 ? c->r[n] : ld32(c->r[13] + 4 * (n - 4)); }
