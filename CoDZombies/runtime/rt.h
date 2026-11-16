@@ -16,6 +16,14 @@
 #define GUEST_HEAP_HI    0x30000000u
 #define GUEST_SENTINEL   0xffff0000u   /* lr of the outermost call: returning here ends it */
 
+/* The screen. The game is landscape only (UIInterfaceOrientationLandscapeRight).
+ * On the iPhone the loader reported the portrait 320x480 device and IwGx turned
+ * its picture a quarter turn by the blit direction; we report a landscape
+ * surface and draw into a landscape framebuffer, as a landscape view gives on
+ * iOS today. */
+#define SCREEN_W 480
+#define SCREEN_H 320
+
 /* ------------------------------------------------------------- logging */
 extern int g_log_imports;   /* RT_LOG_IMPORTS: log every import call */
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
