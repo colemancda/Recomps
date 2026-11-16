@@ -2,8 +2,11 @@
  *
  *   [GROUP]                 group names and keys are case-insensitive
  *   Key = value  # comment  later definitions override earlier ones
- *   {OS=IPHONE} ... {}      conditional blocks, ended by {} or the next [GROUP];
- *                           we are OS=IPHONE with no device ID
+ *   {OS=IPHONE} ... {}      conditional blocks: a condition holds until the next
+ *                           condition or {}; group headers inside it belong to it.
+ *                           We are OS=IPHONE; ID=ANY, CLASS=ANY and OS=ANY hold;
+ *                           {[GROUP] Key==value} (or !=) compares a setting
+ *                           defined earlier
  *   Key = [GROUP]Other + 4  integer values can be expressions over other settings
  */
 #include <ctype.h>
@@ -26,15 +29,40 @@ static char *trim(char *s) {
     return s;
 }
 
-/* {OS=IPHONE} or {OS=IPHONE, OS=...}: true if any clause names this platform. */
+/* A setting-comparison condition: "[GROUP] Key==value" or "!=". */
+static int compare_condition(const char *cond) {
+    char group[64], key[128], value[128];
+    const char *e = strchr(cond, ']');
+    if (!e) return 0;
+    snprintf(group, sizeof group, "%.*s", (int)(e - cond - 1), cond + 1);
+    const char *op = strstr(e, "==");
+    int negate = 0;
+    if (!op) { op = strstr(e, "!="); negate = 1; }
+    if (!op) return 0;
+    snprintf(key, sizeof key, "%.*s", (int)(op - e - 1), e + 1);
+    snprintf(value, sizeof value, "%s", op + 2);
+    char *k = trim(key), *v = trim(value);
+    size_t n = strlen(v);
+    if (n >= 2 && v[0] == '"' && v[n - 1] == '"') { v[n - 1] = 0; v++; }
+    const char *have = config_get(group, k);
+    int eq = have && !strcasecmp(have, v);
+    return negate ? !eq : eq;
+}
+
+/* {OS=IPHONE}, {ID=ANY}, {OS=BREW, OS=IPHONE}, {[GX] Rasterisation==SW}, {} */
 static int condition_true(const char *cond) {
     if (!*cond) return 1;                        /* {} ends a block */
+    if (*cond == '[') return compare_condition(cond);
     char buf[256];
     snprintf(buf, sizeof buf, "%s", cond);
     char *save;
     for (char *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
         t = trim(t);
-        if (!strncasecmp(t, "OS=", 3) && !strcasecmp(trim(t + 3), "IPHONE")) return 1;
+        char *eq = strchr(t, '=');
+        if (!eq) continue;
+        char *what = trim(eq + 1);
+        if (!strcasecmp(what, "ANY")) return 1;
+        if (!strncasecmp(t, "OS=", 3) && !strcasecmp(what, "IPHONE")) return 1;
     }
     return 0;
 }
@@ -65,7 +93,6 @@ void config_init(void) {
             active = condition_true(trim(l + 1));
             continue;
         }
-        if (*l == '[') active = 1;               /* a group header ends a conditional block */
         if (!active) continue;
         if (*l == '[') {
             char *e = strchr(l, ']');
