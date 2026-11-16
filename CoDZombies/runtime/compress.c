@@ -11,14 +11,15 @@
  * game's derbh archives use this, algorithm 0), zlib or gzip headers, else raw
  * deflate.
  *
- * LZMA comes from liblzma (xz); the host build links Homebrew's. iOS will need
- * it built for the device or a vendored decoder.
+ * LZMA comes from the LZMA SDK's LzmaDec (Igor Pavlov, public domain), which
+ * build.sh downloads into build/third_party at a pinned release; it isn't kept
+ * in the repository. zlib is the system's.
  */
-#include <lzma.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
 
+#include "LzmaDec.h"
 #include "rt.h"
 
 #define CHUNK 16384
@@ -28,9 +29,15 @@ typedef struct Decomp {
     uint32_t read_fn, user_data;
     uint32_t io;           /* guest: { buf, len } followed by the CHUNK-byte buffer */
     z_stream zs;
-    lzma_stream xs;
+    CLzmaDec lz;
+    int lz_ready;          /* header read, decoder allocated */
+    uint8_t hdr[13];       /* LZMA alone: 5 property bytes, 64-bit unpacked size */
+    unsigned nhdr;
+    uint64_t left;         /* unpacked bytes still to come; UINT64_MAX if unknown */
     int started, raw, is_lzma, eof, done;
     uint8_t in[CHUNK];
+    const uint8_t *next_in;   /* input not consumed yet */
+    size_t avail_in;
 } Decomp;
 static Decomp streams[4];
 
@@ -66,26 +73,54 @@ static void pull(CPU *c, Decomp *d) {
     memcpy(d->in, G(d->io + 8), n);
     d->zs.next_in = d->in;
     d->zs.avail_in = n;
-    d->xs.next_in = d->in;
-    d->xs.avail_in = n;
+    d->next_in = d->in;
+    d->avail_in = n;
 }
 
+static void *lz_alloc(ISzAllocPtr p, size_t size) { (void)p; return malloc(size); }
+static void lz_free(ISzAllocPtr p, void *a) { (void)p; free(a); }
+static const ISzAlloc lz_allocator = {lz_alloc, lz_free};
+
 static void read_lzma(CPU *c, Decomp *d, uint32_t out, uint32_t lenp, uint32_t want) {
-    d->xs.next_out = G(out);
-    d->xs.avail_out = want;
-    while (d->xs.avail_out && !d->done) {
-        if (!d->xs.avail_in && !d->eof) pull(c, d);
-        lzma_ret r = lzma_code(&d->xs, d->eof && !d->xs.avail_in ? LZMA_FINISH : LZMA_RUN);
-        if (r == LZMA_STREAM_END) { d->done = 1; break; }
-        if (r == LZMA_BUF_ERROR && d->eof) break;
-        if (r != LZMA_OK) {
+    uint8_t *dst = G(out);
+    uint32_t produced = 0;
+    while (produced < want && !d->done) {
+        if (!d->avail_in && !d->eof) pull(c, d);
+        if (!d->avail_in) break;   /* input ran out */
+        if (!d->lz_ready) {
+            while (d->nhdr < sizeof d->hdr && d->avail_in) {
+                d->hdr[d->nhdr++] = *d->next_in++;
+                d->avail_in--;
+            }
+            if (d->nhdr < sizeof d->hdr) continue;
+            if (LzmaDec_Allocate(&d->lz, d->hdr, LZMA_PROPS_SIZE, &lz_allocator) != SZ_OK) {
+                rt_log("lzma: bad properties %02x", d->hdr[0]);
+                break;
+            }
+            LzmaDec_Init(&d->lz);
+            memcpy(&d->left, d->hdr + 5, 8);   /* all ones: unknown, ends with a mark */
+            d->lz_ready = 1;
+            continue;
+        }
+        SizeT out_len = want - produced, in_len = d->avail_in;
+        ELzmaFinishMode mode = LZMA_FINISH_ANY;
+        if (d->left != UINT64_MAX && d->left <= out_len) { out_len = (SizeT)d->left; mode = LZMA_FINISH_END; }
+        ELzmaStatus status;
+        SRes r = LzmaDec_DecodeToBuf(&d->lz, dst + produced, &out_len, d->next_in, &in_len, mode, &status);
+        d->next_in += in_len;
+        d->avail_in -= in_len;
+        produced += (uint32_t)out_len;
+        if (d->left != UINT64_MAX) d->left -= out_len;
+        if (r != SZ_OK) {
             rt_log("lzma decompression error %d", r);
-            st32(lenp, want - (uint32_t)d->xs.avail_out);
+            st32(lenp, produced);
             ret32(c, 1);
             return;
         }
+        if (status == LZMA_STATUS_FINISHED_WITH_MARK || d->left == 0) d->done = 1;
+        else if (in_len == 0 && out_len == 0 && d->eof) break;
     }
-    st32(lenp, want - (uint32_t)d->xs.avail_out);
+    st32(lenp, produced);
     ret32(c, 0);
 }
 
@@ -103,10 +138,7 @@ static void s3eCompressionDecompRead(CPU *c) {
         d->is_lzma = !zlib_hdr && !gzip_hdr && b0 < 9 * 5 * 5;   /* a valid lc/lp/pb properties byte */
         d->raw = !zlib_hdr && !gzip_hdr && !d->is_lzma;
         if (d->is_lzma) {
-            d->xs = (lzma_stream)LZMA_STREAM_INIT;
-            d->xs.next_in = d->in;
-            d->xs.avail_in = d->zs.avail_in;
-            if (lzma_alone_decoder(&d->xs, UINT64_MAX) != LZMA_OK) { ret32(c, 1); return; }
+            LzmaDec_Construct(&d->lz);
         } else if (inflateInit2(&d->zs, d->raw ? -15 : 15 + 32) != Z_OK) {
             ret32(c, 1);
             return;
@@ -142,7 +174,7 @@ static void s3eCompressionDecompRead(CPU *c) {
 static void s3eCompressionDecompFinal(CPU *c) {
     Decomp *d = decomp_of(arg(c, 0));
     if (!d) { ret32(c, 1); return; }
-    if (d->started && d->is_lzma) lzma_end(&d->xs);
+    if (d->started && d->is_lzma) LzmaDec_Free(&d->lz, &lz_allocator);
     else if (d->started) inflateEnd(&d->zs);
     guest_free(d->io);
     guest_free(d->handle);
