@@ -64,9 +64,9 @@ void imports_init(void) {
     s3e_by_impl = calloc(n, sizeof(ImportFn));
     s3e_names = calloc(n, sizeof(char *));
     missing_seen = calloc(g_import_stub_count, 1);
-    const ImportImpl *tables[] = {g_s3e_impls, g_compress_impls, g_gl_impls};
-    const uint32_t counts[] = {g_s3e_impl_count, g_compress_impl_count, g_gl_impl_count};
-    for (int t = 0; t < 3; t++) {
+    const ImportImpl *tables[] = {g_s3e_impls, g_compress_impls, g_gl_impls, g_sound_impls};
+    const uint32_t counts[] = {g_s3e_impl_count, g_compress_impl_count, g_gl_impl_count, g_sound_impl_count};
+    for (int t = 0; t < 4; t++) {
         for (uint32_t k = 0; k < counts[t]; k++) {
             uint32_t i = (tables[t][k].impl - TEXT_LO) / 4;
             s3e_by_impl[i] = tables[t][k].fn;
@@ -86,6 +86,8 @@ static const ImportStub *find_stub(uint32_t stub) {
 }
 
 ImportFn gl_lookup(const char *name);   /* gl.c */
+
+unsigned g_yield_spin;
 
 uint32_t import_stub_by_name(const char *name) {
     for (uint32_t k = 0; k < g_import_stub_count; k++)
@@ -140,6 +142,8 @@ void rt_import(CPU *c, uint32_t stub) {
             exit(4);
         }
     }
+    /* the frame wait: anything but s3eDeviceYield and s3eTimerGetMs ends a spin */
+    if (s->impl != 0x0001f068u && s->impl != 0x0003ae20u) g_yield_spin = 0;
     if (fn) {
         fn(c);
     } else {
@@ -233,8 +237,8 @@ uint32_t guest_call(CPU *c, uint32_t fn, int nargs, ...) {
     for (int k = 0; k < nargs && k < 7; k++) a[k] = va_arg(ap, uint32_t);
     va_end(ap);
     uint32_t sp = c->r[13], lr = c->r[14];
-    uint32_t r4_11[8];
-    memcpy(r4_11, &c->r[4], sizeof r4_11);
+    uint32_t saved[13];   /* r0-r12: the import that calls back may still read its arguments */
+    memcpy(saved, c->r, sizeof saved);
     uint32_t nsp = (sp - 16) & ~7u;
     for (int k = 4; k < 7; k++) st32(nsp + 4 * (k - 4), a[k]);
     c->r[13] = nsp;
@@ -245,6 +249,6 @@ uint32_t guest_call(CPU *c, uint32_t fn, int nargs, ...) {
     uint32_t r0 = c->r[0];
     c->r[13] = sp;
     c->r[14] = lr;
-    memcpy(&c->r[4], r4_11, sizeof r4_11);   /* callee-saved anyway; keeps the caller's view exact */
+    memcpy(c->r, saved, sizeof saved);
     return r0;
 }
