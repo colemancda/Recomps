@@ -43,9 +43,9 @@ codwawzpc checks the same SHA-256, so its names and addresses apply directly.
 The sweep runs over interleaved literal pools and rodata (lots of
 `andeq`/`eoreq`), so these are upper bounds; a real function list needs
 recursive descent from the entry points, vtables and the branch table at the
-start of `s3e_code`. The `blx` count is high, so whether that's indirect calls
-through the s3e API table or ARM↔Thumb interworking has to be settled before
-the lifter is written. The VFP count matters for armv6 (VFPv2).
+start of `s3e_code`. The high `blx` count is ARM↔Thumb interworking, not calls
+through a table (see `S3E_BOUNDARY.md`); much of the code is Thumb, which an
+ARM sweep misreads. The VFP count matters for armv6 (VFPv2).
 
 ## Under Bridge32
 
@@ -69,17 +69,16 @@ it can be compared with the recompiled build.
 
 ## What this means for the plan
 
-- **Two lifting targets.** `s3e_code` is the game, and its only way out is
-  Marmalade's s3e API. `__text` is Marmalade's iOS layer, which talks to
-  UIKit/EAGL/AudioQueue through 32-bit Objective-C. One option is to lift only
-  `s3e_code` and reimplement the s3e API natively on arm64 iOS, which avoids
-  bridging 32-bit Objective-C at all. The other is to lift both and keep a
-  Bridge32-style Objective-C bridge. The first needs the s3e API boundary
-  mapped (how `s3e_code` reaches `__text`: the branch table at 0x65f74 and
-  `blx` through function tables), and that's the next survey item.
+- **Lift only `s3e_code`.** `s3e_code` is the game, and its only way out is
+  809 stubs into Marmalade's iOS layer: about 150 s3e functions plus 98
+  OpenGL ES functions passed straight through. Reimplementing those natively
+  on arm64 iOS avoids lifting `__text` and bridging 32-bit Objective-C. See
+  `S3E_BOUNDARY.md`.
+- **ARM and Thumb.** The high `blx` count is ARM↔Thumb interworking: the start
+  routine is ARM and calls Thumb functions with `blx #imm`. That's why the
+  ARM linear sweep above is noisy.
 - **Lifter.** GunBound's lifter is x86-only, so this needs an ARM (A32,
   armv6 + VFPv2) frontend. Flags are NZCV plus conditional execution on nearly
-  every instruction; there's no Thumb in `s3e_code` at first glance, but that's
-  unconfirmed.
+  every instruction; `s3e_code` mixes ARM and Thumb-1.
 - **Memory.** All guest addresses sit below 0xa1b000 plus heap; the same
   "guest memory at a fixed host base" scheme as GunBound's iOS plan applies.
