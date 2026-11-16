@@ -121,8 +121,19 @@ Bringing the game up exposed control flow the static passes had missed:
   mode, and `rt_call`/`rt_jmp` treat a mode mismatch as a miss: that's how
   `0x1e020c` (ARM, taken for Thumb from a table) showed up. A mode recorded at
   run time overrides the survey's.
+- **The Thumb switch helper** `0x25a71c` (ARM, reached with `blx` from 26
+  Thumb sites) takes its index in r3, reads a byte count just before the
+  return address and a byte table after it, and jumps to
+  `lr + 2 * table[min(r3, count)]`. The analyzer reads the table and the
+  lifter emits the helper's register effects (r3, ip, lr and the flags of its
+  `cmp`) followed by a `switch`. Before this, the return landed in the table
+  and was recorded as a function start.
+- **Computed jumps into straight-line code.** `add pc, pc, rX, lsl #2` with no
+  branch table after it enters an unrolled loop part way (the division
+  routines at `0x665cc`). Every instruction of the run after it is a possible
+  target. Two bogus starts inside that loop came out of `extra_funcs.tsv`.
 - Code still found only at run time is recorded in `extra_funcs.tsv` and lifted
-  next time (`tools/discover.sh`). Ten starts so far.
+  next time (`tools/discover.sh`). Nine starts so far.
 
 ## Imports identified
 
@@ -161,8 +172,36 @@ Bringing the game up exposed control flow the static passes had missed:
 | `0x1e068` | s3eDebugErrorShow | logged; continues |
 | `0x39c3c` | s3eSurfacePtr | 320×480 RGB565 |
 | `0x39c6c` | s3eSurfaceSetup | pixel type `0x422` |
+| `0x2aafc` | s3eGLGetInt | 0: GL version `0x101`, 1: EGL version `0x103`; IwGx takes the hardware path when the GL version is above `0xff` |
+| `0x2ab4c` | s3eGLGetNativeWindow | `0xa` |
+| `0x2aaf4` | s3eGL (nothing on iPhone) | 0 |
+| `0x47e40` | glGetString | the loader's wrapper |
+| `0x460c8`–`0x46900` | EGL 1.2 | see "EGL and GL" |
 
 Error and callback device numbers seen so far: Debug 7, Memory 9, Timer 14.
+
+## EGL and GL
+
+The loader has no real EGL. Its "Ideaworks3D (dummy iPhone impl)" hands out
+fixed handles over EAGL: native window `0xa`, display `0xb`, surface `0xc`,
+config `0xd`. The game reaches it through 34 stubs at `0x2ba6b0` (and a copy at
+`0x2bc168`) in alphabetical EGL 1.2 order, from eglBindAPI to eglWaitNative.
+The order checks out against the dummies: index 4 makes the EAGL context,
+16 takes the native window and returns the display, 18 compares names,
+28 checks display and surface before presenting. `runtime/gl.c` answers with
+the same handles (and context `0xe`).
+
+The GL stubs are named from the executable's indirect symbols. It imports the
+GLES 2 framebuffer names (`glBindFramebuffer`); the game asks
+`eglGetProcAddress` for the OES ones, which get the stub of the name without
+`OES`.
+
+The host build has a null GL backend. Queries get the original iPhone's
+answers (PowerVR MBX, OpenGL ES-CM 1.1, its extension list, PVRTC formats,
+1024 textures, 5/6/5 colour, 24-bit depth), names count up, shader and program
+status is always success, and everything else does nothing. `RT_LOG_GL=1` logs
+the first call of each function that does nothing. `dispatch.c` looks each GL
+stub up once and keeps the answer.
 
 ## Where it stands
 
@@ -177,26 +216,26 @@ From the start routine, the game runs:
    `bootstrap/bootstrap.group.bin`, all LZMA-compressed;
 5. writing its save files (`data-iphone/savedata1.i3d`, `firstRunSink.dat`,
    `shipSink.dat`) into the save directory;
-6. loading `fixed/fixed.group.bin` and the five achievement groups.
+6. GL setup through EGL, then `splash/splash.group.bin` with its textures;
+7. `fixed/fixed.group.bin`, the five achievement groups, the map archives
+   (`_nacht.dz` … `_derriese_full.dz`), `frontend/frontend.group.bin` and
+   `frontend/mapInfo/mapInfo.group.bin`;
+8. its main loop, using about 40 distinct GL functions (matrices, client arrays,
+   `glDrawElements`) and `eglSwapBuffers`. A two-minute run swaps 4800 frames
+   without stopping.
 
-Then IwGx runs out of texture pages ("Out of T-Pages … currently 16 and 0").
-The game asks for a 1.37 GB block and finally calls through a garbage pointer
-from its object walker (`f_000e7c70`). With `[GX] Rasterisation = HW`, the
-texture pages shouldn't be in use at all. The game hasn't made a single GL call,
-because its EGL and GL setup imports (`0x2aafc` and the EGL block around
-`0x46xxx`, whose vendor string is "Ideaworks3D (dummy iPhone impl)") are still
-missing and return 0. IwGx most likely concludes there's no GL and falls back to
-software texture pages.
+Still missing and returning 0: s3eAccelerometer `0x1161c`, s3eDebug `0x1ece0`,
+`0x1fd7c`, s3eKeyboard `0x2ba58`, `0x2bae8`, `0x2bd38`, s3eMemory `0x2f7a8`,
+`0x2f838`, `0x2fdb8`, s3eSocket `0x30d88`, s3eSound `0x34a20`, s3eTimer
+`0x3ac5c` and `0x3b064`, s3eVideo `0x3ba74`.
 
 Next:
 
-- **EGL and GL.** Identify the EGL entry points in the loader (`0x45xxx`–`0x47xxx`)
-  and the s3eGL functions around `0x29a00`–`0x2ac00`. Give the game a
-  headless GL that answers queries (extensions, limits, object names) so it
-  can run its loop. Then real rendering: GLES on iOS, or a GLES-on-desktop
-  layer for the host.
-- **The rest of the reached imports:** s3eKeyboard (`0x2bd38`, `0x2bae8`,
-  `0x2ba58`), s3eMemory (`0x2f7a8`, `0x2fdb8`, `0x2e4b8`), s3eSocket
-  (`0x30d88`), s3eTimer `0x3ac5c` (timer callbacks), s3eSound `0x34a20`,
-  `0x1fd7c`, `0x1ece0`.
-- **Events:** deliver device, pointer and timer callbacks from s3eDeviceYield.
+- **Rendering.** A GL backend that draws: GLES 1.1 through EAGL on iOS, and
+  for the host an offscreen desktop GL context (fixed-point `x` calls
+  converted to float) that can save frames, so the frontend can be checked.
+  Client-array pointers are guest addresses and become host pointers through
+  `G()`; with a buffer bound they stay offsets.
+- **Events and time.** Deliver device, pointer and timer callbacks from
+  s3eDeviceYield, and pace frames.
+- **The missing imports above.**
