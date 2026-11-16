@@ -29,6 +29,10 @@ IPAs in `IPA/Decrypted/` contain the same executable.
 
 - The decrypted binary runs under Bridge32 (dynarmic) as a Mac Catalyst app
   up to the title screen; see `docs/SURVEY.md`.
-- Not started yet: the ARM lifter and the runtime.
+- The boundary between the game and Marmalade's loader is mapped:
+  `tools/s3e_boundary.py` lists all 809 import stubs with their calling
+  convention. The game needs about 150 s3e functions and 98 OpenGL ES
+  functions; see `docs/S3E_BOUNDARY.md`.
+- Not started yet: the ARM/Thumb lifter and the runtime.
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
