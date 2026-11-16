@@ -6,7 +6,10 @@
 #   tools/discover.sh [max-rounds]
 #
 # Runs with RT_MISSING=zero, so unimplemented imports return 0 and the game
-# gets as far as it can. The last run's log is build/run.log.
+# gets as far as it can. The last run's log is build/run.log. Other RT_*
+# settings pass through, so scripted taps (RT_TAPS) can take the runs further
+# in; LOG_IMPORTS=0 leaves out the import log (which fills up while a level
+# loads) and TIMEOUT sets the seconds per run (300).
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +19,10 @@ extra="$here/extra_funcs.tsv"
 
 lifted="$here/build/extra_funcs.lifted"   # the starts the current build was lifted with
 for ((k = 1; k <= rounds; k++)); do
-    (cd build && RT_LOG_LIMIT=${RT_LOG_LIMIT:-80000} RT_EXTRA_FUNCS="$extra" RT_MISSING=zero RT_LOG_IMPORTS=1 timeout 300 ./codz-host ../orig/Payload/kiwi.app > run.log 2>&1)
+    log_imports=(RT_LOG_IMPORTS=1)
+    [ "${LOG_IMPORTS:-1}" = 0 ] && log_imports=()
+    (cd build && env RT_LOG_LIMIT="${RT_LOG_LIMIT:-80000}" RT_EXTRA_FUNCS="$extra" RT_MISSING=zero "${log_imports[@]}" \
+        timeout "${TIMEOUT:-300}" ./codz-host ../orig/Payload/kiwi.app > run.log 2>&1)
     status=$?
     [ -f "$extra" ] && sort -u "$extra" -o "$extra"
     if cmp -s "$extra" "$lifted" || [ ! -f "$extra" ]; then
