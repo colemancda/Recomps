@@ -28,6 +28,16 @@ int main(int argc, char **argv) {
     if (!realpath(s, save)) { perror(s); return 1; }
     g_app_dir = app;
     g_save_dir = save;
+    /* RT_EXTRA_FUNCS is written after the chdir below: make it absolute first */
+    const char *extra = getenv("RT_EXTRA_FUNCS");
+    if (extra && extra[0] != '/') {
+        static char abs_extra[PATH_MAX];
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof cwd)) {
+            snprintf(abs_extra, sizeof abs_extra, "%s/%s", cwd, extra);
+            setenv("RT_EXTRA_FUNCS", abs_extra, 1);
+        }
+    }
     if (chdir(g_app_dir) != 0) { perror(g_app_dir); return 1; }
 
     mem_init();
