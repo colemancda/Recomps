@@ -64,10 +64,14 @@ void imports_init(void) {
     s3e_by_impl = calloc(n, sizeof(ImportFn));
     s3e_names = calloc(n, sizeof(char *));
     missing_seen = calloc(g_import_stub_count, 1);
-    for (uint32_t k = 0; k < g_s3e_impl_count; k++) {
-        uint32_t i = (g_s3e_impls[k].impl - TEXT_LO) / 4;
-        s3e_by_impl[i] = g_s3e_impls[k].fn;
-        s3e_names[i] = g_s3e_impls[k].name;
+    const ImportImpl *tables[] = {g_s3e_impls, g_compress_impls};
+    const uint32_t counts[] = {g_s3e_impl_count, g_compress_impl_count};
+    for (int t = 0; t < 2; t++) {
+        for (uint32_t k = 0; k < counts[t]; k++) {
+            uint32_t i = (tables[t][k].impl - TEXT_LO) / 4;
+            s3e_by_impl[i] = tables[t][k].fn;
+            s3e_names[i] = tables[t][k].name;
+        }
     }
 }
 
@@ -171,16 +175,22 @@ static int call_unlifted(CPU *c, uint32_t a) {
     return 0;
 }
 
+static const char *why(uint32_t a) {
+    uint32_t i = ((a & ~1u) - g_ftab_base) >> 1;
+    if (i < g_ftab_size && g_ftab[i]) return (a & 1) ? "lifted as ARM, called as Thumb" : "lifted as Thumb, called as ARM";
+    return "which isn't lifted code";
+}
+
 void rt_call_slow(CPU *c, uint32_t a) {
     if (call_unlifted(c, a)) return;
     record_missing(a);
-    rt_fatal(c, "indirect call to %08x, which isn't lifted code", a);
+    rt_fatal(c, "indirect call to %08x, %s", a, why(a));
 }
 
 void rt_jmp_slow(CPU *c, uint32_t a, uint32_t from) {
     if (call_unlifted(c, a)) return;
     record_missing(a);
-    rt_fatal(c, "indirect jump from %08x to %08x, which isn't lifted code", from, a);
+    rt_fatal(c, "indirect jump from %08x to %08x, %s", from, a, why(a));
 }
 
 void rt_ret_mismatch(CPU *c, uint32_t expected, uint32_t from) {
