@@ -64,7 +64,7 @@ class Analysis:
                     if len(parts) >= 2 and not parts[0].startswith("#"):
                         a = int(parts[0], 16)
                         if self.in_code(a) and a not in self.table:
-                            self.starts.setdefault(a, parts[1])
+                            self.starts[a] = parts[1]   # seen at run time: overrides the survey's mode
 
     # ------------------------------------------------------------ queries
     def in_code(self, a):
@@ -209,8 +209,10 @@ class Analysis:
             a = work.pop()
             known = {}
             while self.in_code(a) and a not in seen:
-                if a != entry and a in self.starts:
+                if a != entry and self.starts.get(a) == mode:
                     break  # fall-through or branch into another function: tail call
+                # (a start of the other mode at the same address isn't a boundary:
+                # one of the two is a misread pointer, and this walk is real code)
                 ins = self.decode(a, mode)
                 if ins is None:
                     break
@@ -227,7 +229,7 @@ class Analysis:
                 self.track(ins, mode, known)
                 if i == arm.ARM_INS_B:
                     t = ops[0].imm
-                    if self.in_code(t) and not (t in self.starts and t != entry):
+                    if self.in_code(t) and not (self.starts.get(t) == mode and t != entry):
                         work.append(t)
                     if cond:
                         a = nxt
@@ -248,7 +250,7 @@ class Analysis:
                     jt = self.jump_table(ins, mode)
                     if jt:
                         tables[a] = jt
-                        work.extend(t for t in jt if not (t in self.starts and t != entry))
+                        work.extend(t for t in jt if not (self.starts.get(t) == mode and t != entry))
                     if cond:
                         a = nxt
                         continue
