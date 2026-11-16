@@ -70,8 +70,13 @@ extern const uint32_t g_s3e_impl_count;
 extern const ImportImpl g_compress_impls[];  /* compress.c */
 extern const uint32_t g_compress_impl_count;
 extern const ImportImpl g_gl_impls[];        /* gl.c: s3eGL, EGL */
+extern const ImportImpl g_sound_impls[];     /* sound.c: s3eSound, s3eAudio */
+extern const uint32_t g_sound_impl_count;
 extern const uint32_t g_gl_impl_count;
 void imports_init(void);
+/* s3eDeviceYield calls in a row with only s3eTimerGetMs between them (the
+ * game waiting for its next frame); any other import resets it. */
+extern unsigned g_yield_spin;
 /* Stub address of the GL import with this name, or 0. */
 uint32_t import_stub_by_name(const char *name);
 
@@ -91,7 +96,12 @@ void input_pointer(int kind, int pressed, int32_t x, int32_t y);
 void input_deliver(CPU *c);         /* s3eDeviceYield */
 void input_frame(uint32_t frame);   /* eglSwapBuffers: scripted taps (RT_TAPS) */
 
-/* Calls a guest function with up to 7 arguments (callbacks), returning r0. */
+/* -------------------------------------------------------------- sound */
+void sound_pump(CPU *c);            /* s3eDeviceYield: mix ahead of the output */
+
+/* Calls a guest function with up to 7 arguments (callbacks), returning its r0.
+ * r0-r12, sp and lr are as they were afterwards, so the import that called
+ * back can still read its own arguments. */
 uint32_t guest_call(CPU *c, uint32_t fn, int nargs, ...);
 
 #endif
