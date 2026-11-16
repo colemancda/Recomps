@@ -93,6 +93,7 @@ for src in runtime/*.c; do
     "${cc[@]}" "${rt_flags[@]}" -c "$src" -o "$out/runtime/$(basename "${src%.c}").o"
 done
 if [ "$target" = host ]; then
-    "${cc[@]}" -o build/codz-host "$out"/*.o "$out"/runtime/*.o -lz "$lzma_prefix/lib/liblzma.a"
+    "${cc[@]}" -o build/codz-host "$out"/*.o "$out"/runtime/*.o -lz "$lzma_prefix/lib/liblzma.a" \
+        -framework OpenGL -framework CoreGraphics -framework ImageIO -framework CoreFoundation
     echo "linked build/codz-host"
 fi
