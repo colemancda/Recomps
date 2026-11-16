@@ -10,6 +10,7 @@ extern const LiftedFn g_lifted[];
 extern const uint32_t g_lifted_count;
 
 GuestFn *g_ftab;
+uint8_t *g_fmode;
 uint32_t g_ftab_base, g_ftab_size;
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -84,7 +85,10 @@ void load_image(const char *exe) {
     g_ftab_base = lo;
     g_ftab_size = (hi - lo) / 2 + 1;
     g_ftab = calloc(g_ftab_size, sizeof(GuestFn));
-    for (uint32_t k = 0; k < g_lifted_count; k++)
+    g_fmode = calloc(g_ftab_size, 1);
+    for (uint32_t k = 0; k < g_lifted_count; k++) {
         g_ftab[(g_lifted[k].addr - lo) / 2] = g_lifted[k].fn;
+        g_fmode[(g_lifted[k].addr - lo) / 2] = g_lifted[k].thumb;
+    }
     rt_log("%u lifted functions in %08x-%08x", g_lifted_count, lo, hi);
 }
