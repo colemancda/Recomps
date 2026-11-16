@@ -608,7 +608,64 @@ H(wi_FtpGetFileA) {
 }
 H(wi_InternetCloseHandle) { UNUSED; return 1; }
 
+/* netapi32 Netbios: the client reads the adapter MAC (for the login HWID) via the
+ * legacy NetBIOS API. Report one LANA and a fixed fake MAC; never the host's real
+ * address. NCB layout: cmd@0 retcode@1 buffer@4 length@8 lana_num@48. */
+H(na_Netbios) {
+    UNUSED;
+    uint32_t ncb = a[0];
+    if (!ncb) return 0;
+    uint8_t cmd = ld8(ncb) & 0x7Fu; /* strip the ASYNC (NO_WAIT) bit */
+    uint32_t buf = ld32(ncb + 4u);
+    uint32_t len = ld32(ncb + 8u) & 0xFFFFu;
+    switch (cmd) {
+    case 0x37: /* NCBENUM: LANA_ENUM { UCHAR length; UCHAR lana[]; } */
+        if (buf && len >= 2) { st8(buf, 1); st8(buf + 1u, 0); }
+        break;
+    case 0x33: { /* NCBASTAT: ADAPTER_STATUS, adapter_address[6] (the MAC) at offset 0 */
+        static const uint8_t mac[6] = {0x02, 0x00, 0x4C, 0x4F, 0x4F, 0x50};
+        if (buf) {
+            for (uint32_t i = 0; i < len && i < 60u; i++) st8(buf + i, i < 6 ? mac[i] : 0);
+        }
+        break; }
+    case 0x32: /* NCBRESET */
+    default:
+        break;
+    }
+    st8(ncb + 1u, 0); /* ncb_retcode = NRC_GOODRET */
+    return 0;
+}
+
+/* Toolhelp32: the client (GameGuard-style) snapshots the process list to scan for
+ * blacklisted tools. Report one benign process and nothing more, so the scan is
+ * clean. PROCESSENTRY32 (ANSI): dwSize@0 th32ProcessID@8 szExeFile@36 (260). */
+H(th_CreateToolhelp32Snapshot) { UNUSED; return 0xC0DE5300u; } /* a snapshot handle */
+H(th_Process32First) {
+    UNUSED;
+    uint32_t pe = a[1];
+    if (!pe) return 0;
+    st32(pe + 8u, 0x4D2u);                 /* th32ProcessID = 1234 */
+    st32(pe + 20u, 1u);                    /* cntThreads */
+    const char *name = "GMSv62.exe";
+    uint32_t d = pe + 36u;                  /* szExeFile */
+    for (const char *q = name; ; q++) { st8(d++, (uint8_t)*q); if (!*q) break; }
+    return 1;
+}
+H(th_Process32Next) { UNUSED; rt_set_last_error(c, 18); return 0; } /* ERROR_NO_MORE_FILES */
+H(th_Module32First) { UNUSED; rt_set_last_error(c, 18); return 0; }
+H(th_Module32Next) { UNUSED; rt_set_last_error(c, 18); return 0; }
+H(th_Thread32First) { UNUSED; rt_set_last_error(c, 18); return 0; }
+H(th_Thread32Next) { UNUSED; rt_set_last_error(c, 18); return 0; }
+
 static const ImportDef defs[] = {
+    {"kernel32.dll", "CreateToolhelp32Snapshot", th_CreateToolhelp32Snapshot, 2, 0},
+    {"kernel32.dll", "Process32First", th_Process32First, 2, 0},
+    {"kernel32.dll", "Process32Next", th_Process32Next, 2, 0},
+    {"kernel32.dll", "Module32First", th_Module32First, 2, 0},
+    {"kernel32.dll", "Module32Next", th_Module32Next, 2, 0},
+    {"kernel32.dll", "Thread32First", th_Thread32First, 2, 0},
+    {"kernel32.dll", "Thread32Next", th_Thread32Next, 2, 0},
+    {"netapi32.dll", "Netbios", na_Netbios, 1, 0},
     {"wininet.dll", "InternetOpenA", wi_InternetOpenA, 5, 0},
     {"wininet.dll", "InternetConnectA", wi_InternetConnectA, 8, 0},
     {"wininet.dll", "FtpOpenFileA", wi_FtpOpenFileA, 5, 0},

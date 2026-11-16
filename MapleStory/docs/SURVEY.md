@@ -421,3 +421,41 @@ missing login buttons:
 Net: the credential **input path works end to end up to submit** (proven by the
 stored field strings). Reaching character select needs the shape2d transition
 crash fixed (and, for a visible demo, the field/button render).
+
+## End-to-end login works: credentials reach the server (step 6 → login)
+
+The shape2d "crash" on submit was a misdiagnosis: the runtime was aborting on
+unimplemented imports the login path calls (the backtrace's `atan2` frames are
+mis-symbolised trampolines). The login submit calls, in order:
+
+- `netapi32.dll!Netbios` — reads the adapter MAC for the login HWID;
+- `kernel32.dll!CreateToolhelp32Snapshot` + `Process32First/Next`,
+  `Module32First/Next`, `Thread32First/Next` — a GameGuard-style scan of the
+  running processes/modules/threads for blacklisted tools.
+
+Stubbed all of them (runtime/stubs.c): `Netbios` reports one LANA and a fixed
+fake MAC (never the host's real address); the Toolhelp32 snapshot reports one
+benign process and an otherwise empty enumeration, so the scan comes back clean.
+
+With those in place the full login round-trip completes against the real
+`MapleStoryServer62`:
+
+```
+Recieved packet loginRequest (49 bytes)
+Packet: [01 00  0A 00 "hero213644"  06 00 "secret"  00 00 ...]
+Login - hero213644
+Registered User - hero213644
+Send: failure(reason: LoginError.licenseAgreement)
+```
+
+The client encrypts and sends the typed username/password, the server decrypts
+them (correct per-connection IV), auto-registers the account, and replies with
+`licenseAgreement` — the normal v62 response for a brand-new account (it must
+accept the EULA before proceeding). The client receives it and returns to the
+login screen without crashing (exit 0).
+
+Caveat: filling the **Password** field still relies on the local
+`RECOMP_LOGIN_INJECT` focus hook (gitignored `build/gen`), because the click→focus
+dispatch that would move focus between fields is still broken (see above). The ID
+field fills natively. Next steps: handle the `licenseAgreement` step to reach
+world/character select, and fix the real click→focus + field/button render.
