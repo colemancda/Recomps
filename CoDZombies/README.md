@@ -51,7 +51,8 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   level of Nacht der Untoten played through to "Game Over", with sound (the
   game's IwSound callbacks mixed into an AudioQueue).
 - `./build.sh sim` builds an arm64 iOS app (`ios/`) that runs the game in the
-  iOS Simulator, driven by touch from the title screen into a level.
+  iOS Simulator, driven by multi-touch from the title screen into a level,
+  where the sticks move and turn the player and the weapon fires.
   `./build.sh ios` builds the device app (not yet run on a device).
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
