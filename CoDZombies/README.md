@@ -25,7 +25,7 @@ The App Store copy (`IPA/COD Zombies 1.5.0.ipa`) is FairPlay-encrypted
 (`cryptid 1`) and can't be used; `extract.sh` refuses it. The two decrypted
 IPAs in `IPA/Decrypted/` contain the same executable.
 
-## Status: step 1 (lifter)
+## Status: step 2 (runtime bring-up)
 
 - The decrypted binary runs under Bridge32 (dynarmic) as a Mac Catalyst app
   up to the title screen; see `docs/SURVEY.md`.
@@ -41,7 +41,11 @@ IPAs in `IPA/Decrypted/` contain the same executable.
   untranslated. `./build.sh ios` compiles it for arm64 iOS. Single
   instructions (72k runs) and 400 whole leaf functions match Unicorn; see
   `docs/LIFTER.md`.
-- Not started yet: the runtime (guest memory, the s3e and GL imports,
-  callbacks, threads), so nothing links or runs yet.
+- The runtime (`runtime/`, `docs/RUNTIME.md`) runs the lifted game headless on
+  this Mac (`./build.sh host`). It decrypts the game's data as Marmalade's
+  loader does, reads the embedded config and answers 23 identified s3e
+  functions. The game gets through its constructors, memory setup and
+  configuration, and opens `_main.dz`. It then fails to find `console.bin` in
+  its asset archive, which is the next thing to fix.
 
 See `docs/SURVEY.md` for the binary's layout and what it means for the plan.
