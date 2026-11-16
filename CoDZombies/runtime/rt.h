@@ -76,6 +76,17 @@ static inline uint32_t arg(CPU *c, int n) { return n < 4 ? c->r[n] : ld32(c->r[1
 static inline void ret32(CPU *c, uint32_t v) { c->r[0] = v; }
 static inline void ret64(CPU *c, uint64_t v) { c->r[0] = (uint32_t)v; c->r[1] = (uint32_t)(v >> 32); }
 
+/* Callbacks the game registered (s3e.c): calls each one for (device, id) as
+ * fn(data, userdata). */
+void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data);
+
+/* --------------------------------------------------------------- input */
+/* A pointer event, queued until the next s3eDeviceYield: kind 0 button
+ * (pressed 1 or 0), 1 motion; screen coordinates. */
+void input_pointer(int kind, int pressed, int32_t x, int32_t y);
+void input_deliver(CPU *c);         /* s3eDeviceYield */
+void input_frame(uint32_t frame);   /* eglSwapBuffers: scripted taps (RT_TAPS) */
+
 /* Calls a guest function with up to 7 arguments (callbacks), returning r0. */
 uint32_t guest_call(CPU *c, uint32_t fn, int nargs, ...);
 
