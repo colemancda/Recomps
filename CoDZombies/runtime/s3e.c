@@ -460,9 +460,19 @@ void callbacks_fire(CPU *c, uint32_t device, uint32_t id, uint32_t data) {
 }
 
 /* 0x1f068 s3eDeviceYield(int32 ms): where the loader delivers events (see
- * input.c). */
+ * input.c), and gives up the CPU for up to ms.
+ *
+ * The game waits for its next frame by calling s3eDeviceYield(0) and
+ * s3eTimerGetMs in a loop, about 1,400 times a frame. When yields come in a
+ * row with nothing but the timer between them, it is waiting: sleep half a
+ * millisecond. Anything else (loading reads files between yields) resets the
+ * count, so loading isn't slowed. */
 static void s3eDeviceYield(CPU *c) {
+    int32_t ms = (int32_t)arg(c, 0);
     input_deliver(c);
+    sound_pump(c);
+    if (ms > 0) usleep((useconds_t)(ms > 100 ? 100 : ms) * 1000);
+    else if (++g_yield_spin >= 4) usleep(500);
     ret64(c, 0);
 }
 
