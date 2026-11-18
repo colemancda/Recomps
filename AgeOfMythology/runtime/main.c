@@ -35,6 +35,9 @@ static void usage(const char *argv0) {
             "                      down, up, click X Y, rdown, rup, key VK DIK, keydown/keyup VK DIK,\n"
             "                      text STRING, fullscr, quit. A frame written +N counts from the previous step.\n"
             "  --input-file FILE   the same, one step per line; # starts a comment line\n"
+            "  --soft-cursor       draw the game's cursor into the picture at the game's pointer position and\n"
+            "                      hide the system pointer (for controllers and touch, where the compositor\n"
+            "                      shows no pointer)\n"
             "  --no-sound          tell the game there is no sound device\n"
             "  --font-dir DIR      directory with the Liberation TrueType fonts that stand in for\n"
             "                      Arial, Times New Roman and Courier New\n"
@@ -73,6 +76,7 @@ static void usage(const char *argv0) {
 }
 
 /* --input and --input-file can be repeated; the steps are concatenated. */
+extern int rt_soft_cursor;
 static void add_input(const char *steps) {
     size_t n = strlen(g_opt.input_script);
     snprintf(g_opt.input_script + n, sizeof g_opt.input_script - n, "%s%s", n ? ";" : "", steps);
@@ -181,6 +185,7 @@ int main(int argc, char **argv) {
             else { usage(argv[0]); return 2; }
         }
         else if (!strcmp(o, "--dump-window")) g_opt.dump_window = 1;
+        else if (!strcmp(o, "--soft-cursor")) rt_soft_cursor = 1;
         else if (!strcmp(o, "--virtual-clock")) g_opt.virtual_clock = 1;
         else if (!strcmp(o, "--no-sound")) g_opt.no_sound = 1;
         else if (!strcmp(o, "--font-dir") && has) rt_gdi_set_font_dir(argv[++i]);

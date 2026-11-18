@@ -666,3 +666,27 @@ Open:
   (qemu). An x86 run with OpenGL ES gives the same hashes and its frame 36000
   is the end of the game: "You have been defeated", "Record Game Ended", the
   Town Center burned down to a Settlement, as in the live game under Wine.
+
+## Handhelds and the window renderer
+
+- **Packaging.** `package.sh` builds `build/dist/aom-rocknix.tar.gz` (ROCKNIX port:
+  launcher, program, the lifted `msxml4` DLLs, Liberation fonts; no game data). It runs
+  on the Powkiddy X55 (RK3566, Mali-G52), the Retroid Pocket Flip 2 (Adreno 650) and,
+  with its own `aom.sh`, a Debian tablet with GNOME (Lenovo Duet 3, Adreno 618).
+  The program needs libSDL2, libEGL, libGLESv2, libfreetype and glibc 2.38.
+- **Cursor.** The game's pointer is an SDL colour cursor, which the compositor shows only
+  with a real mouse; stick or touch input moves the game's pointer alone. `--soft-cursor`
+  draws the current cursor shape into the window at the guest pointer instead and hides
+  the system pointer. The stock cursors, which have no pixels, get a plain arrow.
+- **Window renderer.** The game's Direct3D frame is read back and presented through SDL.
+  Under X11 that has to use SDL's software renderer (SDL's GLX context cannot share the
+  thread with Direct3D's EGL one). Where SDL itself uses EGL (Wayland, KMS/DRM) the window
+  now uses SDL's GPU renderer. SDL keeps its own record of which context is current and
+  does not notice `d3d8gl.c`'s `eglMakeCurrent`, so before drawing the runtime releases and
+  reselects SDL's context through SDL (`sdl_gl_reclaim`). With SDL 2 on SDL 3 (sdl2-compat)
+  the software renderer cannot be created once framebuffer acceleration is off, which left
+  the game without a window. `RECOMP_SDL_RENDERER=hardware|software` overrides the choice.
+- **Open: text at 1024x768.** Glyphs with descenders (p, y, g) are drawn wrong at 1024x768
+  (the descender is missing and shows up as a mark elsewhere, "Options" reads "Qptions");
+  640x480 is clean. The raw frame has it, the x86_64 build too, so it is in the text
+  textures, not in presenting. The rendered descenders do fit the reported ascent/descent.

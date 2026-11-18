@@ -476,6 +476,7 @@ static const struct { uint8_t vk, dik; } keymap[SDL_NUM_SCANCODES] = {
  *            This is the default; it is the same as nearest when the view is a
  *            whole multiple.
  * Pointer positions are mapped back through the same rectangle. */
+static SDL_GLContext sdl_gl_ctx;     /* the GPU renderer's context, NULL with the software renderer */
 static SDL_Rect view;                /* where the picture is, in output pixels */
 static int out_w, out_h;             /* renderer output size */
 static SDL_Texture *prescale;        /* render target for the sharp filter */
@@ -704,14 +705,24 @@ static void sdl_open(const char *title, int width, int height) {
     }
     if (g_opt.fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, flags);
-    /* Direct3D draws with its own EGL context on this thread (d3d8gl.c); a thread
-     * cannot also hold SDL's GLX context, so the window then uses SDL's software
-     * renderer: the frames arrive as plain pixels anyway. */
+    /* Direct3D draws with its own EGL context on this thread (d3d8gl.c), and takes it back
+     * before every use. Under X11 SDL's renderer would need a GLX context on the same
+     * thread, which cannot coexist, so there the window uses SDL's software renderer: the
+     * frames arrive as plain pixels anyway. Where SDL itself uses EGL (Wayland, KMS/DRM)
+     * the two contexts coexist and the window uses the GPU renderer.
+     * RECOMP_SDL_RENDERER=hardware|software overrides the choice. */
     int gl_in_use = !getenv("RECOMP_NO_GL");
-    /* and SDL must not back that window surface with a GL renderer of its own */
-    if (gl_in_use) SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
-    if (window && !gl_in_use)
+    const char *drv = SDL_GetCurrentVideoDriver();
+    int egl_video = drv && (!strcmp(drv, "wayland") || !strcmp(drv, "KMSDRM") || !strcmp(drv, "kmsdrm"));
+    const char *want = getenv("RECOMP_SDL_RENDERER");
+    int hardware = want ? !strcmp(want, "hardware") : (!gl_in_use || egl_video);
+    if (window && hardware) {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        renderer_shares_gl = renderer != NULL;
+        if (!renderer) rt_log("recomp: no hardware renderer (%s); using the software one\n", SDL_GetError());
+    }
+    /* SDL must not back the window surface with a GL renderer of its own */
+    if (window && !renderer && gl_in_use) SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
     if (window && !renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     if (window && !renderer && gl_in_use) {
         /* Wayland: SDL2's software renderer needs a GL-backed window surface. Both
@@ -726,6 +737,9 @@ static void sdl_open(const char *title, int width, int height) {
         rt_affinity_host(0);
         return;
     }
+    /* The GPU renderer's GL context, which the Direct3D layer's own context displaces on this
+     * thread without SDL noticing: sdl_gl_reclaim() puts it back before SDL draws. */
+    sdl_gl_ctx = renderer_shares_gl ? SDL_GL_GetCurrentContext() : NULL;
     is_fullscreen = g_opt.fullscreen;
     SDL_StartTextInput();
     have_window = 1;
@@ -763,12 +777,20 @@ static void dump_window(unsigned frame) {
     free(rgb);
 }
 
+int rt_soft_cursor; /* --soft-cursor: draw the game's cursor into the window */
 static void cursor_apply(void);
+static void cursor_draw(void);
+/* SDL records which GL context it made current and skips the switch when asked for the same one
+ * again, but d3d8gl.c's eglMakeCurrent changes it behind SDL's back. Releasing and re-selecting
+ * through SDL's own calls makes SDL really switch. */
+static void sdl_gl_reclaim(void) {
+    if (!sdl_gl_ctx || !window) return;
+    SDL_GL_MakeCurrent(window, NULL);
+    if (SDL_GL_MakeCurrent(window, sdl_gl_ctx) != 0) rt_log("recomp: cannot reselect SDL's GL context (%s)\n", SDL_GetError());
+}
 static void sdl_flush(void) {
     cursor_apply();
-    /* d3d8gl.c made its own context current behind SDL's back; forgetting SDL's makes
-     * the renderer activate its context again before it draws */
-    if (renderer_shares_gl) SDL_GL_MakeCurrent(window, NULL);
+    sdl_gl_reclaim();
     pthread_mutex_lock(&frame_mu);
     if (frame_dirty && frame_px) {
         if (!texture || tex_w != frame_w || tex_h != frame_h) {
@@ -824,6 +846,7 @@ static void sdl_flush(void) {
                 SDL_SetTextureScaleMode(texture, filter == RT_FILTER_NEAREST ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
             SDL_RenderCopy(renderer, src, NULL, &view);
         }
+        if (rt_soft_cursor) cursor_draw();
         if (dump_at) dump_window(dump_at);
         SDL_RenderPresent(renderer);
         return;
@@ -1027,6 +1050,7 @@ typedef struct CursorShape {
     int w, h, hx, hy;
 #ifndef RT_NO_SDL
     SDL_Cursor *sdl;
+    SDL_Texture *tex; /* the shape as a texture, for --soft-cursor */
 #endif
 } CursorShape;
 static CursorShape cursors[256];
@@ -1054,6 +1078,11 @@ void rt_video_set_cursor(int id) { __atomic_store_n(&cursor_want, id, __ATOMIC_R
 /* The selected shape on the window; video thread. */
 static void cursor_apply(void) {
     int id = __atomic_load_n(&cursor_want, __ATOMIC_RELAXED);
+    if (rt_soft_cursor) { /* drawn by cursor_draw: the system pointer stays hidden */
+        if (cursor_shown_id != -2) SDL_ShowCursor(SDL_DISABLE);
+        cursor_shown_id = -2;
+        return;
+    }
     if (id == cursor_shown_id) return;
     SDL_Cursor *cur = NULL;
     static SDL_Cursor *system[SDL_NUM_SYSTEM_CURSORS];
@@ -1080,6 +1109,52 @@ static void cursor_apply(void) {
         SDL_ShowCursor(id == RT_CURSOR_NONE ? SDL_DISABLE : SDL_ENABLE);
     cursor_shown_id = id;
     if (cur) SDL_SetCursor(cur);
+}
+
+/* --soft-cursor: the game's current cursor shape, drawn into the window at the guest
+ * pointer, scaled with the picture. The stock cursors have no pixels of their own and
+ * get a plain arrow. Video thread, after the picture has been copied. */
+static SDL_Texture *arrow_tex;
+static SDL_Texture *argb_texture(const uint32_t *argb, int w, int h) {
+    SDL_Texture *t = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (!t) return NULL;
+    SDL_UpdateTexture(t, NULL, argb, w * 4);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureScaleMode(t, SDL_ScaleModeLinear);
+    return t;
+}
+static int arrow_in(int x, int y) { return x >= 0 && y >= 0 && y <= 16 && x <= y * 13 / 16; }
+static void cursor_draw(void) {
+    int id = __atomic_load_n(&cursor_want, __ATOMIC_RELAXED);
+    if (id == RT_CURSOR_NONE || !renderer || screen_w <= 0 || screen_h <= 0) return;
+    SDL_Texture *tex = NULL;
+    int w = 14, h = 17, hx = 0, hy = 0;
+    pthread_mutex_lock(&cursor_mu);
+    CursorShape *cs = id >= 0 && id < ncursors ? &cursors[id] : NULL;
+    if (cs) {
+        if (!cs->tex) cs->tex = argb_texture(cs->argb, cs->w, cs->h);
+        tex = cs->tex;
+        w = cs->w, h = cs->h, hx = cs->hx, hy = cs->hy;
+    }
+    pthread_mutex_unlock(&cursor_mu);
+    if (!tex) {
+        if (!arrow_tex) {
+            uint32_t px[14 * 17];
+            for (int y = 0; y < 17; y++)
+                for (int x = 0; x < 14; x++) {
+                    int in = arrow_in(x, y);
+                    int edge = in && (!arrow_in(x - 1, y) || !arrow_in(x + 1, y) || !arrow_in(x, y - 1) || !arrow_in(x, y + 1));
+                    px[y * 14 + x] = !in ? 0u : edge ? 0xff000000u : 0xffffffffu;
+                }
+            arrow_tex = argb_texture(px, 14, 17);
+        }
+        tex = arrow_tex;
+        if (!tex) return;
+    }
+    int sx_num = view.w, sx_den = screen_w, sy_num = view.h, sy_den = screen_h;
+    SDL_Rect dst = {view.x + (rt_mouse_x - hx) * sx_num / sx_den, view.y + (rt_mouse_y - hy) * sy_num / sy_den,
+                    w * sx_num / sx_den, h * sy_num / sy_den};
+    SDL_RenderCopy(renderer, tex, NULL, &dst);
 }
 #endif
 
