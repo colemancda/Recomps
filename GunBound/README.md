@@ -146,6 +146,8 @@ Options:
 | `--login USER PASSWORD`, `--login-key FILE`, `--print-token` | make the session token from the launcher's key instead of taking it from `--cmdline`; print it and exit |
 | `--scale N`, `--window-size WxH`, `--fullscreen` | window size as a multiple of 800x600 or in pixels; start full screen (Alt+Enter switches at any time) |
 | `--scale-mode MODE` | `fit`: the largest picture with the game's aspect ratio (default); `integer`: whole multiples only; `stretch`: fill the window |
+| `--second-screen MODE` | `auto` (default): on a device with two screens the second shows a touch keyboard; `on`: make that window on a single screen too (to try it); `off`: never. See "Second screen" |
+| `--dump-osk FILE` | where the input command `kdump` writes the keyboard window (a PNG) |
 | `--filter FILTER` | `sharp`: point sampling up to the next whole multiple, then bilinear down to the picture's size (default); `nearest`; `linear` |
 | `--no-sound`, `--dump-audio FILE` | tell the game there is no sound device; write the mixed sound to a WAV file instead of playing it (works headless) |
 | `--dump-frame N[,N...]`, `--dump-every N`, `--dump-path FILE` | write presented frames (1 = first) as PNG files; a `%d` in the path is the frame number |
@@ -195,6 +197,7 @@ identical. It needs the game's files (`GAMEDIR`).
 
 ```
 recomp/test/pad.sh [host|aarch64 ...]   # controller and touch, no device and no server
+recomp/test/osk.sh [host|aarch64 ...]   # the second-screen keyboard, no second screen and no server
 ```
 
 `pad.sh` runs the game to its world-list screen while a script pushes the left
@@ -822,6 +825,41 @@ physical button SDL calls A with the user's EmulationStation mapping (the
 mapping file says the one labelled A); a battle on the screen rather than
 headless; starting it from the Ports menu instead of ssh; how long the
 battery lasts.
+
+## Second screen
+
+A device with two screens (the Anbernic RG DS: two 640x480 panels, each with a touch screen) has
+nothing to put on the lower one, and the game has no way to enter text without a keyboard. The
+runtime therefore opens a second window there with a touch keyboard (`runtime/osk.c`); what is
+tapped enters the game as a keyboard's input does.
+
+- **Detection** at start: two connected internal panels (`DSI`, `eDP` or `LVDS` connectors in
+  `/sys/class/drm`) or two SDL displays make a dual-screen device; the log says which
+  (`recomp: screens: 2 SDL displays, 2 internal panels: dual screen`). On one screen nothing is
+  opened. `--second-screen on` opens the window anyway, `off` never.
+- **Placement.** The window is titled `GunBound Keyboard (Bottom)`. ROCKNIX's sway configuration
+  moves a window whose title has `Bottom`, `Secondary`, `Sub`, `Screen 2` or `GamePad` to the
+  second output and powers it on (it keeps that output off otherwise, for EmulationStation);
+  when SDL lists two displays the window is also created on the one the game is not on. Checked
+  with `swaymsg -t get_tree`: the game fullscreen on `DSI-2`, the keyboard fullscreen on `DSI-1`.
+- **The keyboard** is drawn on a 640x480 canvas fitted into the window, with a 5x7 font of its own:
+  digits, letters, a symbols layer (`?123`), Shift (one tap is for one character, two taps
+  lock), Space, Backspace (repeats while held), Enter, Esc and Tab, and a field above the keys
+  with what was typed since the last Enter. Characters are sent as `WM_CHAR` (`rt_in_char`), the
+  others as key presses (`rt_in_key`: VK_BACK, VK_RETURN, VK_ESCAPE, VK_TAB).
+- **Focus.** Tapping the keyboard window takes the compositor's focus from the game's window;
+  the game's loss of focus is ignored while the keyboard exists, so it stays active.
+- **Touch.** Events of the keyboard window (`SDL_TouchFingerEvent.windowID`, and mouse clicks for
+  a desktop) are the keyboard's and never reach the game; the game's touch handling is as before.
+
+Verified on an RG DS (ROCKNIX, kernel 7.2, SDL 2.32): in the lobby the chat box was clicked and
+`hi ds` typed with taps on the keyboard window; the server logged
+`ChannelChatBroadcast(... username: AnbernicDS, message: "hi ds")` and the other devices showed it.
+Real touches were injected into the kernel touch devices (`event2` is the game's panel, `event3`
+the second one; each covers a whole 640x480 panel): taps on `event3` typed `pa` in the keyboard,
+taps on `event2` went to the game. `test/osk.sh` drives the keyboard with the input script's
+`ktap X Y` (a tap, in thousandths of the keyboard window) and `kdump` (writes the window) on SDL's
+dummy video driver and checks the characters and keys that come out.
 
 ## Next
 

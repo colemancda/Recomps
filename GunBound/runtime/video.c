@@ -11,6 +11,10 @@
 #include "rt.h"
 #include "video.h"
 
+/* the on-screen keyboard on a second screen (osk.c): what the input script can drive */
+void osk_tap(int x1000, int y1000);
+void osk_dump(void);
+
 #ifndef RT_NO_SDL
 #include <SDL.h>
 #endif
@@ -286,6 +290,8 @@ static void script_run(void) {
         else if (!strcmp(s->cmd, "tdown")) script_touch(RT_TOUCH_DOWN, s->a, s->b);
         else if (!strcmp(s->cmd, "tmove")) script_touch(RT_TOUCH_MOVE, s->a, s->b);
         else if (!strcmp(s->cmd, "tup")) script_touch(RT_TOUCH_UP, 0, 0);
+        else if (!strcmp(s->cmd, "ktap")) osk_tap(s->a, s->b);
+        else if (!strcmp(s->cmd, "kdump")) osk_dump();
         else {
             rt_log("recomp: --input: unknown command \"%s\"\n", s->cmd);
         }
@@ -407,6 +413,12 @@ static void dump_frame(const uint16_t *px, int w, int h) {
 
 /* ------------------------------------------------------------------- SDL */
 #ifndef RT_NO_SDL
+/* the on-screen keyboard on a second screen (osk.c) */
+int osk_active(void);
+void osk_open(SDL_Window *game);
+int osk_handle_event(const SDL_Event *e);
+void osk_tick(void);
+void osk_present(void);
 static SDL_Window *window;
 static SDL_Renderer *renderer;
 static SDL_Texture *texture;
@@ -713,6 +725,7 @@ static void sdl_open(const char *title, int width, int height) {
     view_update();
     if (g_opt.fullscreen) SDL_ShowCursor(SDL_DISABLE); /* the game draws its own */
     pads_open();
+    osk_open(window);
     rt_affinity_host(0);
     SDL_RendererInfo info;
     memset(&info, 0, sizeof info);
@@ -746,6 +759,7 @@ static void dump_window(unsigned frame) {
 }
 
 static void sdl_flush(void) {
+    osk_present();
     pthread_mutex_lock(&frame_mu);
     if (frame_dirty && frame_px) {
         if (!texture || tex_w != frame_w || tex_h != frame_h) {
@@ -811,6 +825,7 @@ static void sdl_flush(void) {
 static int warp_x, warp_y, warp_pending; /* where rt_video_warp_mouse last sent the pointer, in window coordinates */
 
 static void sdl_translate(const SDL_Event *e) {
+    if (osk_handle_event(e)) return; /* the keyboard window's own */
     switch (e->type) {
     case SDL_QUIT: {
         RtInputEvent ev = {.type = RT_EV_QUIT};
@@ -818,6 +833,8 @@ static void sdl_translate(const SDL_Event *e) {
         break;
     }
     case SDL_WINDOWEVENT:
+        /* tapping the keyboard window takes the focus from the game's: the game stays active */
+        if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST && osk_active()) break;
         if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
             RtInputEvent ev = {.type = RT_EV_FOCUS};
             ev.down = e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED;
@@ -951,6 +968,7 @@ static void sdl_translate(const SDL_Event *e) {
 }
 
 static void sdl_poll(void) {
+    osk_tick();
     SDL_Event e;
     while (npending < 32 && SDL_PollEvent(&e)) sdl_translate(&e);
 }
@@ -991,6 +1009,8 @@ static void script_pad_plug(int plug) { if (!plug) rt_pad_release_all(); }
 static void script_touch(int phase, int px, int py) { rt_touch(phase, px * screen_w / 1000, py * screen_h / 1000); }
 static void sdl_flush(void) {}
 static void sdl_poll(void) {}
+void osk_tap(int x, int y) { (void)x, (void)y; }
+void osk_dump(void) {}
 void rt_video_warp_mouse(int x, int y) { (void)x, (void)y; }
 void rt_video_show_cursor(int show) { (void)show; }
 void rt_video_set_title(const char *title) { (void)title; }
