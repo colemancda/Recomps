@@ -151,3 +151,7 @@ Everything the port prints is in /storage/roms/ports/gunbound/log.txt.
 * A profile of where the time goes:  add  --profile /tmp/gb.prof  to
   GB_OPTIONS, play, quit with Select+Start, and copy /tmp/gb.prof to the PC
   (recomp/tools/profile_report.py reads it together with the program).
+
+Two screens (Anbernic RG DS): the second screen shows a touch keyboard for typing in the game
+(chat, room names). It is detected by itself; --second-screen off (in GB_OPTIONS in gunbound.conf)
+turns it off, --second-screen on opens it on a single screen.

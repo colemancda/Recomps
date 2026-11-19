@@ -6,6 +6,8 @@
 #include "pad.h"
 #include "rt.h"
 
+extern int rt_osk_mode;
+extern char rt_osk_dump_path[512];
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [options] [--] [guest command line arguments...]\n"
@@ -31,6 +33,9 @@ static void usage(const char *argv0) {
             "  --filter FILTER     sharp (whole-multiple point sampling, then bilinear; default),\n"
             "                      nearest or linear\n"
             "  --dump-window       frame dumps also write FILE.window.png: the window's contents\n"
+            "  --second-screen M   auto (default), on or off: on a device with two screens the second\n"
+            "                      one shows a touch keyboard for typing (on makes the window on one screen too)\n"
+            "  --dump-osk FILE     where the input command kdump writes the keyboard window (a PNG)\n"
             "  --input SCRIPT      synthetic input: \"FRAME:command;...\" with the commands move X Y,\n"
             "                      down, up, click X Y, rdown, rup, key VK DIK, keydown/keyup VK DIK,\n"
             "                      text STRING, fullscr, quit. A frame written +N counts from the previous step.\n"
@@ -179,6 +184,14 @@ int main(int argc, char **argv) {
             else { usage(argv[0]); return 2; }
         }
         else if (!strcmp(o, "--dump-window")) g_opt.dump_window = 1;
+        else if (!strcmp(o, "--second-screen") && has) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "auto")) rt_osk_mode = 0;
+            else if (!strcmp(v, "on")) rt_osk_mode = 1;
+            else if (!strcmp(v, "off")) rt_osk_mode = -1;
+            else { usage(argv[0]); return 2; }
+        }
+        else if (!strcmp(o, "--dump-osk") && has) snprintf(rt_osk_dump_path, sizeof rt_osk_dump_path, "%s", argv[++i]);
         else if (!strcmp(o, "--virtual-clock")) g_opt.virtual_clock = 1;
         else if (!strcmp(o, "--no-sound")) g_opt.no_sound = 1;
         else if (!strcmp(o, "--dump-audio") && has) snprintf(g_opt.dump_audio, sizeof g_opt.dump_audio, "%s", argv[++i]);
